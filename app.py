@@ -5,7 +5,7 @@ import joblib
 import json
 import re
 import shap
-from groq import Groq  # PERUBAHAN: Menggunakan library resmi Groq
+from groq import Groq
 
 st.set_page_config(
     page_title="VBD Clinical Decision Support",
@@ -47,7 +47,6 @@ def get_groq_client():
     api_key = st.secrets.get("GROQ_API_KEY", None)
     if api_key is None:
         return None
-    # PERUBAHAN: Inisialisasi client Groq yang benar
     return Groq(api_key=api_key)
 
 SYSTEM_PROMPT = """You are a clinical decision support \
@@ -316,9 +315,8 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
         st.session_state[context_key] = False
 
     st.markdown("### 🤖 AI Clinical Assistant")
-    # PERUBAHAN: Menyesuaikan teks UI karena sekarang pakai Groq
     st.caption(
-        "Powered by Groq (Llama 3 70B) · "
+        "Powered by Groq (Llama 3.1 70B) · "
         "Ask follow-up questions about this assessment · "
         "For decision support only")
 
@@ -353,10 +351,10 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 with st.spinner(
                         "Generating initial interpretation..."):
                     try:
-                        # PERUBAHAN: Menggunakan model Llama 3 yang didukung Groq
+                        # PERUBAHAN: Llama 3.1 70B Versatile
                         response = \
                             client.chat.completions.create(
-                                model="llama3-70b-8192", 
+                                model="llama-3.1-70b-versatile", 
                                 messages=[
                                     {"role"   : "system",
                                      "content": SYSTEM_PROMPT},
@@ -411,9 +409,9 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 response_placeholder = st.empty()
                 full_response        = ""
                 try:
-                    # PERUBAHAN: Menggunakan model Llama 3 yang didukung Groq
+                    # PERUBAHAN: Llama 3.1 70B Versatile
                     stream = client.chat.completions.create(
-                        model="llama3-70b-8192",
+                        model="llama-3.1-70b-versatile",
                         messages=[
                             {"role"   : "system",
                              "content": SYSTEM_PROMPT},
@@ -579,7 +577,7 @@ with st.sidebar:
     st.markdown("**AI Assistant**")
     grok_ok = st.secrets.get("GROQ_API_KEY", None) is not None
     if grok_ok:
-        st.success("Groq AI: connected") # PERUBAHAN UI Text
+        st.success("Groq AI: connected") 
     else:
         st.warning("Groq AI: not configured")
 
