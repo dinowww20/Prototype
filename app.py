@@ -1,21 +1,3 @@
-# ============================================================
-# app.py — Vector-Borne Disease CDSS
-# Streamlit Cloud Deployment
-#
-# Struktur repo GitHub:
-# ├── app.py
-# ├── requirements.txt
-# └── artifacts/
-#     ├── model_0_Malaria.pkl
-#     ├── model_1_Dengue.pkl
-#     ├── model_2_Yellow_Fever.pkl
-#     ├── model_3_Typhoid.pkl
-#     ├── model_4_Others.pkl
-#     ├── metadata.json
-#     ├── feature_names.txt
-#     └── bootstrap_stats.pkl
-# ============================================================
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,7 +5,7 @@ import joblib
 import json
 import re
 import shap
-from openai import OpenAI
+from groq import Groq  # PERUBAHAN: Menggunakan library resmi Groq
 
 st.set_page_config(
     page_title="VBD Clinical Decision Support",
@@ -58,17 +40,15 @@ POP_MEAN_STD  = BOOT_STATS['pop_mean_std']
 POP_STD_LABEL = np.array(BOOT_STATS['pop_std_per_label'])
 
 # ============================================================
-# GROK AI CLIENT
+# GROQ AI CLIENT
 # ============================================================
 @st.cache_resource
-def get_grok_client():
+def get_groq_client():
     api_key = st.secrets.get("GROQ_API_KEY", None)
     if api_key is None:
         return None
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://api.x.ai/v1",
-    )
+    # PERUBAHAN: Inisialisasi client Groq yang benar
+    return Groq(api_key=api_key)
 
 SYSTEM_PROMPT = """You are a clinical decision support \
 assistant helping healthcare workers interpret vector-borne \
@@ -320,7 +300,7 @@ def build_context_message(pred, shap_results, patient_info):
     )
 
 def render_ai_chat(pred, X_arr, patient_info, chat_key):
-    client = get_grok_client()
+    client = get_groq_client()
     if client is None:
         st.warning(
             "AI chat unavailable — "
@@ -336,8 +316,9 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
         st.session_state[context_key] = False
 
     st.markdown("### 🤖 AI Clinical Assistant")
+    # PERUBAHAN: Menyesuaikan teks UI karena sekarang pakai Groq
     st.caption(
-        "Powered by Grok 4.3 (xAI) · "
+        "Powered by Groq (Llama 3 70B) · "
         "Ask follow-up questions about this assessment · "
         "For decision support only")
 
@@ -372,9 +353,10 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 with st.spinner(
                         "Generating initial interpretation..."):
                     try:
+                        # PERUBAHAN: Menggunakan model Llama 3 yang didukung Groq
                         response = \
                             client.chat.completions.create(
-                                model="grok-4.3",
+                                model="llama3-70b-8192", 
                                 messages=[
                                     {"role"   : "system",
                                      "content": SYSTEM_PROMPT},
@@ -429,8 +411,9 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 response_placeholder = st.empty()
                 full_response        = ""
                 try:
+                    # PERUBAHAN: Menggunakan model Llama 3 yang didukung Groq
                     stream = client.chat.completions.create(
-                        model="grok-4.3",
+                        model="llama3-70b-8192",
                         messages=[
                             {"role"   : "system",
                              "content": SYSTEM_PROMPT},
@@ -596,9 +579,9 @@ with st.sidebar:
     st.markdown("**AI Assistant**")
     grok_ok = st.secrets.get("GROQ_API_KEY", None) is not None
     if grok_ok:
-        st.success("Grok 4.3: connected")
+        st.success("Groq AI: connected") # PERUBAHAN UI Text
     else:
-        st.warning("Grok 4.3: not configured")
+        st.warning("Groq AI: not configured")
 
 # ============================================================
 # MAIN
@@ -730,8 +713,8 @@ with tab1:
             'Nombre_de_globules_blancs_cellulesML_Whi' : float(wbc),
             'Température_axillaire_médiane_IQR_C_Axil' : float(temp_val),
             'Fréquence_du_pouls_battementsm_in_SD_Pul' : float(pulse),
-            'Poids_Weight'                              : float(weight),
-            'Âge_Age'                                   : float(age),
+            'Poids_Weight'                             : float(weight),
+            'Âge_Age'                                  : float(age),
             'Genre_Gender'      : 1.0 if gender == 'Male' else 0.0,
             'Centre_de_santé'   : 0.0 if faskes == 'CMA de DO' else 1.0,
         }
@@ -786,8 +769,8 @@ with tab1:
         row['FE_resp_score']       = resp_score
         row['FE_neuro_score']      = neuro_score
         row['FE_fever_score']      = fever_score
-        row['FE_has_msk']          = float(msk_score   >= 2)
-        row['FE_has_gi']           = float(gi_score    >= 2)
+        row['FE_has_msk']          = float(msk_score    >= 2)
+        row['FE_has_gi']           = float(gi_score     >= 2)
         row['FE_has_resp']         = float(resp_score  >= 2)
         row['FE_has_neuro']        = float(neuro_score >= 2)
         row['FE_dengue_pattern']   = msk_score * gi_score
