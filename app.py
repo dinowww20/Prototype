@@ -1,3 +1,21 @@
+# ============================================================
+# app.py — Vector-Borne Disease CDSS
+# Streamlit Cloud Deployment
+#
+# Struktur repo GitHub:
+# ├── app.py
+# ├── requirements.txt
+# └── artifacts/
+#     ├── model_0_Malaria.pkl
+#     ├── model_1_Dengue.pkl
+#     ├── model_2_Yellow_Fever.pkl
+#     ├── model_3_Typhoid.pkl
+#     ├── model_4_Others.pkl
+#     ├── metadata.json
+#     ├── feature_names.txt
+#     └── bootstrap_stats.pkl
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -316,7 +334,7 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
 
     st.markdown("### 🤖 AI Clinical Assistant")
     st.caption(
-        "Powered by Groq (Llama 3.1 70B) · "
+        "Powered by Groq (Llama 3.1 8B Instant) · "
         "Ask follow-up questions about this assessment · "
         "For decision support only")
 
@@ -351,10 +369,10 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 with st.spinner(
                         "Generating initial interpretation..."):
                     try:
-                        # PERUBAHAN: Llama 3.1 70B Versatile
+                        # PERUBAHAN: Menggunakan llama-3.1-8b-instant
                         response = \
                             client.chat.completions.create(
-                                model="llama-3.1-70b-versatile", 
+                                model="llama-3.1-8b-instant", 
                                 messages=[
                                     {"role"   : "system",
                                      "content": SYSTEM_PROMPT},
@@ -409,9 +427,9 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 response_placeholder = st.empty()
                 full_response        = ""
                 try:
-                    # PERUBAHAN: Llama 3.1 70B Versatile
+                    # PERUBAHAN: Menggunakan llama-3.1-8b-instant
                     stream = client.chat.completions.create(
-                        model="llama-3.1-70b-versatile",
+                        model="llama-3.1-8b-instant",
                         messages=[
                             {"role"   : "system",
                              "content": SYSTEM_PROMPT},
