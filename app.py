@@ -1,5 +1,3 @@
-
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +5,7 @@ import joblib
 import json
 import re
 import shap
+from openai import OpenAI
 
 st.set_page_config(
     page_title="VBD Clinical Decision Support",
@@ -39,6 +38,62 @@ THRESHOLDS    = np.array(META['cv_thresholds'])
 UNC_P75       = META['unc_p75']
 POP_MEAN_STD  = BOOT_STATS['pop_mean_std']
 POP_STD_LABEL = np.array(BOOT_STATS['pop_std_per_label'])
+
+# ============================================================
+# GROK AI CLIENT
+# ============================================================
+@st.cache_resource
+def get_grok_client():
+    api_key = st.secrets.get("GROQ_API_KEY", None)
+    if api_key is None:
+        return None
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.x.ai/v1",
+    )
+
+SYSTEM_PROMPT = """You are a clinical decision support \
+assistant helping healthcare workers interpret vector-borne \
+disease probability assessments from an AI model trained on \
+clinical data from Burkina Faso, West Africa.
+
+The AI model is a Binary Relevance Random Forest trained on \
+300 patients from two health facilities (CMA de DO and \
+CMA de DAFRA). It predicts probabilities for 5 diseases: \
+Malaria, Dengue, Yellow Fever, Typhoid, and Others.
+Model CV F1 Macro: 0.6272 ± 0.0376 (5-fold CV, N=300).
+
+You MUST follow these rules strictly:
+1. Always frame output as probability-based decision support,
+   never as definitive diagnosis.
+2. Always recommend confirmation by a licensed medical
+   professional through clinical examination and lab tests.
+3. Use precise clinical language appropriate for healthcare
+   professionals.
+4. Reference specific probability values from the model output.
+5. Acknowledge model uncertainty explicitly when std is high
+   (above P75 threshold = flagged in input).
+6. When explaining SHAP values, explain in plain clinical
+   terms what the feature means and why its direction makes
+   sense clinically.
+7. Keep each section concise — this is a clinical tool,
+   not an essay.
+
+You MUST NOT:
+1. State that a patient "has" or "is diagnosed with" a disease.
+2. Provide specific drug dosages or treatment regimens.
+3. Override or contradict the model probability outputs.
+4. Make clinical claims beyond what the model evidence supports.
+5. Ignore the uncertainty flag if present.
+
+Structure your response in exactly three sections with
+these headers:
+### Prediction Interpretation
+### Recommended Clinical Actions
+### Key Contributing Factors (SHAP)
+
+If SHAP data is not available, write "SHAP not available
+for this prediction mode" in the third section."""
 
 # ============================================================
 # PREPROCESSING — identik dengan notebook
@@ -88,15 +143,19 @@ def build_fe_batch1(df):
         (df.get('Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
                 pd.Series(0, index=df.index)) == 1)
     ).astype(int)
-    df['Âge (Age)'] = pd.to_numeric(df['Âge (Age)'], errors='coerce')
+    df['Âge (Age)'] = pd.to_numeric(
+        df['Âge (Age)'], errors='coerce')
     df['FE_is_child']       = (df['Âge (Age)'] < 18).astype(int)
     df['FE_is_young_adult'] = (
         (df['Âge (Age)'] >= 18) &
         (df['Âge (Age)'] < 35)).astype(int)
     df['FE_is_elderly']     = (df['Âge (Age)'] >= 60).astype(int)
-    df['FE_dengue_pattern']  = df['FE_msk_score'] * df['FE_gi_score']
-    df['FE_typhoid_pattern'] = df['FE_gi_score'] * (4 - df['FE_msk_score'])
-    df['FE_others_pattern']  = df['FE_resp_score'] * 2 - df['FE_msk_score']
+    df['FE_dengue_pattern']  = (
+        df['FE_msk_score'] * df['FE_gi_score'])
+    df['FE_typhoid_pattern'] = (
+        df['FE_gi_score'] * (4 - df['FE_msk_score']))
+    df['FE_others_pattern']  = (
+        df['FE_resp_score'] * 2 - df['FE_msk_score'])
     return df
 
 def clean_colname(col):
@@ -118,51 +177,38 @@ def fix_cols(X):
 def apply_yf_rules(X_val, probas, feature_names):
     probas = probas.copy()
     fn = list(feature_names)
-    muscle_col = [c for c in fn if 'Muscle' in c and 'pain' in c.lower()]
-    cough_col  = [c for c in fn if 'Cough' in c or 'Toux' in c]
+    muscle_col = [c for c in fn
+                  if 'Muscle' in c and 'pain' in c.lower()]
+    cough_col  = [c for c in fn
+                  if 'Cough' in c or 'Toux' in c]
     conv_col   = [c for c in fn if 'Generalised' in c]
     mask = np.zeros(len(X_val), dtype=bool)
-    if muscle_col: mask |= (X_val[:, fn.index(muscle_col[0])] == 0)
-    if cough_col:  mask |= (X_val[:, fn.index(cough_col[0])]  == 1)
-    if conv_col:   mask |= (X_val[:, fn.index(conv_col[0])]   == 1)
+    if muscle_col:
+        mask |= (X_val[:, fn.index(muscle_col[0])] == 0)
+    if cough_col:
+        mask |= (X_val[:, fn.index(cough_col[0])]  == 1)
+    if conv_col:
+        mask |= (X_val[:, fn.index(conv_col[0])]   == 1)
     probas[mask, 2] = 0.0
     return probas
 
 def preprocess_df(df):
-    """
-    Full preprocessing pipeline — identik dengan notebook.
-    Target cols di-drop SEBELUM FE dan fix_cols
-    untuk menghindari potential leakage.
-    """
-    # Drop target cols dan leakage cols SEBELUM apapun
     drop_before = [c for c in
                    META['target_cols'] +
                    ['Dengue (Dengua)', 'n_diseases']
                    if c in df.columns]
     df = df.drop(columns=drop_before)
-
-    # Feature engineering
     df = build_fe_batch1(df)
-
-    # Clean column names
     df = fix_cols(df)
-
-    # Align ke feature names dari training
     for col in FEATURE_NAMES:
         if col not in df.columns:
             df[col] = 0
-
     return df[FEATURE_NAMES].fillna(0).astype(np.float32)
 
 # ============================================================
 # PREDICTION ENGINE
 # ============================================================
 def predict_dataset_patient(patient_idx):
-    """
-    Pasien dari dataset (0-299):
-    pakai bootstrap stats exact dari notebook.
-    Identik dengan output notebook — tidak ada recompute.
-    """
     return {
         'mean'  : BOOT_STATS['mean'][patient_idx],
         'std'   : float(BOOT_STATS['std'][patient_idx].mean()),
@@ -172,26 +218,12 @@ def predict_dataset_patient(patient_idx):
     }
 
 def predict_new_patient(X_arr):
-    """
-    Pasien baru (manual input / upload CSV):
-    - Point estimate dari model RF (identik dengan notebook)
-    - YF rules diterapkan (identik dengan notebook)
-    - CI = point_estimate ± 1.96 × pop_std_per_label
-      (population-level proxy dari bootstrap notebook)
-    - std = pop_mean_std sebagai proxy uncertainty
-
-    Limitation: CI adalah population-level estimate,
-    bukan individual bootstrap CI. Data training tidak
-    di-ship ke app untuk menjaga privasi data klinis.
-    """
     probas = np.column_stack([
         m.predict_proba(X_arr)[:, 1] for m in models
     ])
     probas = apply_yf_rules(X_arr, probas, FEATURE_NAMES)
-
-    lower = np.clip(probas - 1.96 * POP_STD_LABEL, 0, 1)
-    upper = np.clip(probas + 1.96 * POP_STD_LABEL, 0, 1)
-
+    lower  = np.clip(probas - 1.96 * POP_STD_LABEL, 0, 1)
+    upper  = np.clip(probas + 1.96 * POP_STD_LABEL, 0, 1)
     return {
         'mean'  : probas[0],
         'std'   : float(POP_MEAN_STD),
@@ -201,7 +233,6 @@ def predict_new_patient(X_arr):
     }
 
 def get_shap_top3(X_arr, label_idx):
-    """SHAP top 3 features untuk satu label."""
     exp = shap.TreeExplainer(models[label_idx])
     sv  = exp.shap_values(X_arr)
     if isinstance(sv, list):
@@ -211,6 +242,131 @@ def get_shap_top3(X_arr, label_idx):
     top3 = np.argsort(np.abs(sv[0]))[::-1][:3]
     return [(FEATURE_NAMES[i][:45], float(sv[0, i]),
              float(X_arr[0, i])) for i in top3]
+
+# ============================================================
+# AI INTERPRETATION
+# ============================================================
+def build_ai_prompt(pred, shap_results, patient_info):
+    mean_p = pred['mean']
+    std    = pred['std']
+    lo     = pred['lower']
+    hi     = pred['upper']
+    source = pred['source']
+    unc    = std > UNC_P75
+
+    prob_lines = []
+    for i in np.argsort(mean_p)[::-1]:
+        above  = mean_p[i] >= THRESHOLDS[i]
+        marker = "ABOVE THRESHOLD" if above else "below threshold"
+        prob_lines.append(
+            f"- {LABELS[i]}: {mean_p[i]*100:.1f}% "
+            f"[95% CI: {lo[i]*100:.1f}%–{hi[i]*100:.1f}%] "
+            f"({marker}, threshold={THRESHOLDS[i]:.2f})"
+        )
+
+    shap_lines = []
+    for label, top3 in shap_results.items():
+        shap_lines.append(f"\n{label}:")
+        for feat, sv, fv in top3:
+            direction = "increases" if sv > 0 else "decreases"
+            shap_lines.append(
+                f"  - {feat}: value={fv:.2f}, "
+                f"SHAP={sv:+.4f} ({direction} probability)"
+            )
+
+    ci_note = (
+        "CI is population-level estimate "
+        "(not individual bootstrap CI — new patient)."
+        if source == 'population_estimate'
+        else "CI is individual bootstrap CI (N=50 iterations)."
+    )
+
+    return f"""Interpret the following vector-borne disease \
+probability assessment for a healthcare worker.
+
+PATIENT INFORMATION:
+- Age: {patient_info.get('age', 'Unknown')}
+- Gender: {patient_info.get('gender', 'Unknown')}
+- Facility: {patient_info.get('faskes', 'Unknown')}
+
+MODEL OUTPUT (sorted by probability):
+{chr(10).join(prob_lines)}
+
+UNCERTAINTY:
+- Mean prediction std: {std:.4f}
+- Population P75 threshold: {UNC_P75:.4f}
+- Uncertainty flag: \
+{"HIGH — second opinion recommended" if unc else "Within normal range"}
+- {ci_note}
+
+SHAP CONTRIBUTING FACTORS (top 3 per label above threshold):
+{chr(10).join(shap_lines) if shap_lines else "Not available."}
+
+Please provide your clinical interpretation."""
+
+def render_ai_interpretation(pred, X_arr, patient_info):
+    client = get_grok_client()
+    if client is None:
+        st.warning(
+            "AI interpretation unavailable — "
+            "GROQ_API_KEY not found in Streamlit secrets.")
+        return
+
+    mean_p       = pred['mean']
+    above_labels = [i for i in range(5)
+                    if mean_p[i] >= THRESHOLDS[i]]
+
+    shap_results = {}
+    if X_arr is not None and above_labels:
+        with st.spinner("Computing SHAP for AI context..."):
+            for i in above_labels[:3]:
+                shap_results[LABELS[i]] = get_shap_top3(X_arr, i)
+
+    prompt = build_ai_prompt(pred, shap_results, patient_info)
+
+    st.markdown("### AI Clinical Interpretation")
+    st.caption(
+        "Generated by Grok (xAI) · "
+        "For clinical decision support only · "
+        "Not a substitute for clinical judgment")
+    st.markdown("---")
+
+    response_placeholder = st.empty()
+    full_response        = ""
+
+    try:
+        stream = client.chat.completions.create(
+            model="grok-3-fast",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=800,
+            temperature=0.3,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                full_response += delta
+                response_placeholder.markdown(
+                    full_response + "▌")
+
+        response_placeholder.markdown(full_response)
+
+        st.caption(
+            "⚕️ DISCLAIMER: This AI interpretation is generated "
+            "by a large language model and is for clinical "
+            "decision support only. It does not constitute "
+            "medical advice or diagnosis. All clinical decisions "
+            "must be made by a licensed medical professional "
+            "based on full clinical assessment.")
+
+    except Exception as e:
+        st.error(f"AI interpretation error: {e}")
+        st.caption(
+            "Check GROQ_API_KEY in Streamlit secrets "
+            "and ensure sufficient API credits.")
 
 # ============================================================
 # REPORT RENDERER
@@ -233,15 +389,13 @@ def render_report(pred, X_arr=None, show_shap=True,
     source   = pred['source']
     unc_flag = std > UNC_P75
 
-    # CI source note untuk pasien baru
     if source == 'population_estimate':
         st.info(
-            "ℹ️ Confidence interval shown is a population-level "
-            "estimate (± 1.96 × population std from training "
-            "bootstrap, N=50). Individual bootstrap CI is only "
-            "available for dataset patients (Tab 3).")
+            "ℹ️ CI shown is a population-level estimate "
+            "(± 1.96 × population std from training bootstrap, "
+            "N=50). Individual bootstrap CI available in "
+            "Tab 3 for dataset patients.")
 
-    # Uncertainty banner
     if unc_flag:
         st.warning(
             f"⚠️ High uncertainty "
@@ -252,12 +406,10 @@ def render_report(pred, X_arr=None, show_shap=True,
             f"✓ Confidence within normal population range "
             f"(std={std:.4f})")
 
-    # Disease probability rows
     st.markdown("**Disease probability assessment** "
                 "| Threshold: median 5-fold CV")
-    sorted_idx = np.argsort(mean_p)[::-1]
 
-    for i in sorted_idx:
+    for i in np.argsort(mean_p)[::-1]:
         label  = LABELS[i]
         prob   = float(mean_p[i])
         above  = prob >= THRESHOLDS[i]
@@ -265,19 +417,19 @@ def render_report(pred, X_arr=None, show_shap=True,
         color  = COLORS[i]
         action = ACTIONS[label] if above else "Monitor"
 
-        col1, col2, col3 = st.columns([2, 3, 3])
-        with col1:
+        c1, c2, c3 = st.columns([2, 3, 3])
+        with c1:
             st.markdown(
                 f"<span style='color:{color};"
                 f"font-weight:600'>{marker} {label}</span>",
                 unsafe_allow_html=True)
-        with col2:
+        with c2:
             st.progress(prob)
             st.caption(
                 f"{prob*100:.1f}% "
                 f"[{float(lo[i])*100:.1f}–"
                 f"{float(hi[i])*100:.1f}%]")
-        with col3:
+        with c3:
             if above:
                 st.error(f"→ {action}")
             else:
@@ -288,14 +440,12 @@ def render_report(pred, X_arr=None, show_shap=True,
         + " | ".join([f"{l[:3]}={t:.2f}"
                       for l, t in zip(LABELS, THRESHOLDS)]))
 
-    # SHAP
     if show_shap and X_arr is not None:
         above_labels = [i for i in range(5)
                         if float(mean_p[i]) >= THRESHOLDS[i]]
         if above_labels:
             st.markdown("---")
-            st.markdown("**Top contributing factors** "
-                        "(labels above threshold, via SHAP)")
+            st.markdown("**Top contributing factors (SHAP)**")
             for i in above_labels[:3]:
                 with st.expander(
                         f"{LABELS[i]} — "
@@ -315,20 +465,18 @@ def render_report(pred, X_arr=None, show_shap=True,
                             f"{direction}</span>",
                             unsafe_allow_html=True)
 
-    # Ground truth jika tersedia
     if true_dx is not None:
         st.markdown("---")
         st.caption(
-            f"[Evaluation only — not available in deployment] "
+            "[Evaluation only — not available in deployment] "
             f"True diagnosis: "
             f"{', '.join(true_dx) if true_dx else 'None'}")
 
     st.markdown("---")
     st.caption(
-        "⚕️ This output is for clinical decision support only. "
+        "⚕️ For clinical decision support only. "
         "Final diagnosis must be confirmed by a licensed "
-        "medical professional. Not a substitute for clinical "
-        "examination or laboratory testing.")
+        "medical professional.")
 
 # ============================================================
 # SIDEBAR
@@ -356,6 +504,13 @@ with st.sidebar:
     st.markdown("**Per-label pop std**")
     for l, s in zip(LABELS, POP_STD_LABEL):
         st.caption(f"{l}: {s:.4f}")
+    st.markdown("---")
+    st.markdown("**AI Interpretation**")
+    grok_ok = st.secrets.get("GROQ_API_KEY", None) is not None
+    if grok_ok:
+        st.success("Grok AI: connected")
+    else:
+        st.warning("Grok AI: not configured")
 
 # ============================================================
 # MAIN
@@ -441,7 +596,8 @@ with tab1:
         with col:
             for orig, label in sym_list[ci*n_per:(ci+1)*n_per]:
                 sym_vals[orig] = st.checkbox(
-                    label, key=f"sym_{ci}_{hash(orig)}")
+                    label,
+                    key=f"sym_{ci}_{hash(orig)}")
 
     st.markdown("### Lab values (optional)")
     lc1, lc2, lc3 = st.columns(3)
@@ -471,18 +627,16 @@ with tab1:
 
     if st.button("Generate assessment",
                  type="primary",
-                 use_container_width=True):
+                 use_container_width=True,
+                 key="btn_manual"):
 
-        # Build feature vector
         row = {col: 0.0 for col in FEATURE_NAMES}
 
-        # Symptom values
         for orig_col, val in sym_vals.items():
             clean = clean_colname(orig_col)
             if clean in row:
                 row[clean] = float(int(val))
 
-        # Lab values
         lab_map = {
             'Numération_plaquettaire_Platelet_count'   : float(platelet),
             'Nombre_de_globules_blancs_cellulesML_Whi' : float(wbc),
@@ -497,15 +651,17 @@ with tab1:
             if k in row:
                 row[k] = v
 
-        # FE scores — identik dengan build_fe_batch1
         msk_score = float(sum([
-            int(sym_vals.get('Douleur articulaire (Joint pain)', False)),
-            int(sym_vals.get('Douleur musculaire ( Muscle pain)', False)),
+            int(sym_vals.get(
+                'Douleur articulaire (Joint pain)', False)),
+            int(sym_vals.get(
+                'Douleur musculaire ( Muscle pain)', False)),
         ]))
         gi_score = float(sum([
             int(sym_vals.get('Vomissement (Vomiting)', False)),
             int(sym_vals.get('Diarrhée  (Diarrhea)', False)),
-            int(sym_vals.get('Douleur abdominale (stomac pain)', False)),
+            int(sym_vals.get(
+                'Douleur abdominale (stomac pain)', False)),
             int(sym_vals.get('Nausée (Nausea)', False)),
         ]))
         resp_score = float(sum([
@@ -523,30 +679,6 @@ with tab1:
                 'Troubles de la conscience (Consciousness trouble)',
                 False)),
         ]))
-
-        row['FE_msk_score']       = msk_score
-        row['FE_gi_score']        = gi_score
-        row['FE_resp_score']      = resp_score
-        row['FE_neuro_score']     = neuro_score
-        row['FE_has_msk']         = float(msk_score  >= 2)
-        row['FE_has_gi']          = float(gi_score   >= 2)
-        row['FE_has_resp']        = float(resp_score  >= 2)
-        row['FE_has_neuro']       = float(neuro_score >= 2)
-        row['FE_dengue_pattern']  = msk_score * gi_score
-        row['FE_typhoid_pattern'] = gi_score * (4 - msk_score)
-        row['FE_others_pattern']  = resp_score * 2 - msk_score
-        row['FE_is_child']        = float(age < 18)
-        row['FE_is_young_adult']  = float(18 <= age < 35)
-        row['FE_is_elderly']      = float(age >= 60)
-        row['FE_persistent_fever'] = float(
-            sym_vals.get(
-                'Fièvre depuis 48 heures(Fever 48 hrs)',
-                False) and
-            sym_vals.get(
-                'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
-                False))
-
-        # fever_score untuk FE_fever_score
         fever_score = float(sum([
             int(sym_vals.get(
                 'Haute température.(temperature, Hyperpyrexia)',
@@ -558,7 +690,29 @@ with tab1:
                 'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
                 False)),
         ]))
-        row['FE_fever_score'] = fever_score
+
+        row['FE_msk_score']        = msk_score
+        row['FE_gi_score']         = gi_score
+        row['FE_resp_score']       = resp_score
+        row['FE_neuro_score']      = neuro_score
+        row['FE_fever_score']      = fever_score
+        row['FE_has_msk']          = float(msk_score   >= 2)
+        row['FE_has_gi']           = float(gi_score    >= 2)
+        row['FE_has_resp']         = float(resp_score  >= 2)
+        row['FE_has_neuro']        = float(neuro_score >= 2)
+        row['FE_dengue_pattern']   = msk_score * gi_score
+        row['FE_typhoid_pattern']  = gi_score * (4 - msk_score)
+        row['FE_others_pattern']   = resp_score * 2 - msk_score
+        row['FE_is_child']         = float(age < 18)
+        row['FE_is_young_adult']   = float(18 <= age < 35)
+        row['FE_is_elderly']       = float(age >= 60)
+        row['FE_persistent_fever'] = float(
+            sym_vals.get(
+                'Fièvre depuis 48 heures(Fever 48 hrs)',
+                False) and
+            sym_vals.get(
+                'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
+                False))
 
         X_manual = np.array(
             [[row.get(f, 0.0) for f in FEATURE_NAMES]],
@@ -566,9 +720,27 @@ with tab1:
 
         st.markdown("---")
         st.markdown("### Assessment result")
+
         with st.spinner("Computing prediction..."):
             pred = predict_new_patient(X_manual)
+
         render_report(pred, X_arr=X_manual, show_shap=True)
+
+        # AI Interpretation
+        st.markdown("---")
+        with st.expander(
+                "🤖 Get AI clinical interpretation",
+                expanded=False):
+            if st.button(
+                    "Generate AI interpretation ↗",
+                    key="ai_btn_manual"):
+                patient_info = {
+                    'age'   : f"{age} years",
+                    'gender': gender,
+                    'faskes': faskes,
+                }
+                render_ai_interpretation(
+                    pred, X_manual, patient_info)
 
 # ── TAB 2: UPLOAD CSV ─────────────────────────────────────
 with tab2:
@@ -593,7 +765,8 @@ with tab2:
 
             if st.button("Run batch assessment",
                          type="primary",
-                         use_container_width=True):
+                         use_container_width=True,
+                         key="btn_csv"):
 
                 with st.spinner(
                         "Preprocessing & predicting..."):
@@ -605,7 +778,6 @@ with tab2:
                     probas_b = apply_yf_rules(
                         X_batch, probas_b, FEATURE_NAMES)
 
-                # Summary table
                 st.markdown("### Batch results summary")
                 results = pd.DataFrame(
                     (probas_b >= THRESHOLDS).astype(int),
@@ -625,8 +797,7 @@ with tab2:
 
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.metric("Total patients",
-                              len(df_up))
+                    st.metric("Total patients", len(df_up))
                 with c2:
                     n_co = (results['n_diseases'] >= 2).sum()
                     st.metric("Co-infections", n_co,
@@ -638,7 +809,6 @@ with tab2:
                     st.metric("Yellow Fever predicted",
                               results['Yellow Fever'].sum())
 
-                # Per-patient detail
                 st.markdown("### Per-patient detail")
                 pat_sel = st.selectbox(
                     "Select patient for detailed report",
@@ -647,12 +817,30 @@ with tab2:
 
                 pred_sel = predict_new_patient(
                     X_batch[pat_sel:pat_sel+1])
+
                 render_report(
                     pred_sel,
                     X_arr=X_batch[pat_sel:pat_sel+1],
                     show_shap=True)
 
-                # Download
+                # AI Interpretation
+                st.markdown("---")
+                with st.expander(
+                        "🤖 Get AI clinical interpretation",
+                        expanded=False):
+                    if st.button(
+                            "Generate AI interpretation ↗",
+                            key="ai_btn_csv"):
+                        patient_info_csv = {
+                            'age'   : 'From CSV',
+                            'gender': 'From CSV',
+                            'faskes': 'From CSV',
+                        }
+                        render_ai_interpretation(
+                            pred_sel,
+                            X_batch[pat_sel:pat_sel+1],
+                            patient_info_csv)
+
                 st.download_button(
                     "Download results CSV",
                     data=results.to_csv(index=False),
@@ -682,16 +870,33 @@ with tab3:
 
     if st.button("Lookup patient",
                  type="primary",
-                 use_container_width=True):
+                 use_container_width=True,
+                 key="btn_lookup"):
 
         pred = predict_dataset_patient(int(pat_idx))
+
         st.markdown(f"### Report — Patient #{pat_idx}")
         st.caption(
-            "Bootstrap CI: exact from notebook (N=50). "
-            "SHAP not shown — use Manual Input tab for "
-            "SHAP explanations on a specific patient.")
+            "Bootstrap CI: exact from notebook (N=50).")
+
         render_report(
             pred,
             X_arr=None,
             show_shap=False,
             true_dx=None)
+
+        # AI Interpretation
+        st.markdown("---")
+        with st.expander(
+                "🤖 Get AI clinical interpretation",
+                expanded=False):
+            if st.button(
+                    "Generate AI interpretation ↗",
+                    key="ai_btn_lookup"):
+                patient_info_ds = {
+                    'age'   : f"Patient #{pat_idx} (from dataset)",
+                    'gender': 'From dataset',
+                    'faskes': 'From dataset',
+                }
+                render_ai_interpretation(
+                    pred, None, patient_info_ds)
