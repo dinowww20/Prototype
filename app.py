@@ -1,20 +1,3 @@
-# ============================================================
-# app.py — Vector-Borne Disease CDSS
-# Streamlit Cloud Deployment
-#
-# Struktur repo GitHub:
-# ├── app.py
-# ├── requirements.txt
-# └── artifacts/
-#     ├── model_0_Malaria.pkl
-#     ├── model_1_Dengue.pkl
-#     ├── model_2_Yellow_Fever.pkl
-#     ├── model_3_Typhoid.pkl
-#     ├── model_4_Others.pkl
-#     ├── metadata.json
-#     ├── feature_names.txt
-#     └── bootstrap_stats.pkl
-# ============================================================
 
 import streamlit as st
 import pandas as pd
@@ -334,7 +317,6 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
 
     st.markdown("### 🤖 AI Clinical Assistant")
     st.caption(
-        "Powered by Groq (Llama 3.1 8B Instant) · "
         "Ask follow-up questions about this assessment · "
         "For decision support only")
 
