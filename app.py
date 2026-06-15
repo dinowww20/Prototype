@@ -1,3 +1,21 @@
+# ============================================================
+# app.py — Vector-Borne Disease CDSS
+# Streamlit Cloud Deployment
+#
+# Struktur repo GitHub:
+# ├── app.py
+# ├── requirements.txt
+# └── artifacts/
+#     ├── model_0_Malaria.pkl
+#     ├── model_1_Dengue.pkl
+#     ├── model_2_Yellow_Fever.pkl
+#     ├── model_3_Typhoid.pkl
+#     ├── model_4_Others.pkl
+#     ├── metadata.json
+#     ├── feature_names.txt
+#     └── bootstrap_stats.pkl
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -61,7 +79,11 @@ The AI model is a Binary Relevance Random Forest trained on \
 300 patients from two health facilities (CMA de DO and \
 CMA de DAFRA). It predicts probabilities for 5 diseases: \
 Malaria, Dengue, Yellow Fever, Typhoid, and Others.
-Model CV F1 Macro: 0.6272 ± 0.0376 (5-fold CV, N=300).
+Model CV F1 Macro: 0.6272 plus-minus 0.0376 (5-fold CV, N=300).
+
+The user is a healthcare worker. You have been provided with
+the full assessment context in the first message. Use it
+as the basis for all your answers.
 
 You MUST follow these rules strictly:
 1. Always frame output as probability-based decision support,
@@ -70,30 +92,23 @@ You MUST follow these rules strictly:
    professional through clinical examination and lab tests.
 3. Use precise clinical language appropriate for healthcare
    professionals.
-4. Reference specific probability values from the model output.
-5. Acknowledge model uncertainty explicitly when std is high
-   (above P75 threshold = flagged in input).
+4. Reference specific probability values from the context.
+5. Acknowledge model uncertainty when flagged as HIGH.
 6. When explaining SHAP values, explain in plain clinical
-   terms what the feature means and why its direction makes
-   sense clinically.
-7. Keep each section concise — this is a clinical tool,
-   not an essay.
+   terms what the feature means clinically.
+7. Answer follow-up questions concisely and accurately.
+8. If asked something outside the scope of the assessment,
+   politely redirect to the clinical context.
 
 You MUST NOT:
-1. State that a patient "has" or "is diagnosed with" a disease.
+1. State that a patient has or is diagnosed with a disease.
 2. Provide specific drug dosages or treatment regimens.
 3. Override or contradict the model probability outputs.
 4. Make clinical claims beyond what the model evidence supports.
-5. Ignore the uncertainty flag if present.
 
-Structure your response in exactly three sections with
-these headers:
-### Prediction Interpretation
-### Recommended Clinical Actions
-### Key Contributing Factors (SHAP)
-
-If SHAP data is not available, write "SHAP not available
-for this prediction mode" in the third section."""
+Always remind the user that your output is for clinical
+decision support only and not a substitute for clinical
+judgment when relevant."""
 
 # ============================================================
 # PREPROCESSING — identik dengan notebook
@@ -244,9 +259,9 @@ def get_shap_top3(X_arr, label_idx):
              float(X_arr[0, i])) for i in top3]
 
 # ============================================================
-# AI INTERPRETATION
+# AI CHAT HELPERS
 # ============================================================
-def build_ai_prompt(pred, shap_results, patient_info):
+def build_context_message(pred, shap_results, patient_info):
     mean_p = pred['mean']
     std    = pred['std']
     lo     = pred['lower']
@@ -260,7 +275,7 @@ def build_ai_prompt(pred, shap_results, patient_info):
         marker = "ABOVE THRESHOLD" if above else "below threshold"
         prob_lines.append(
             f"- {LABELS[i]}: {mean_p[i]*100:.1f}% "
-            f"[95% CI: {lo[i]*100:.1f}%–{hi[i]*100:.1f}%] "
+            f"[95% CI: {lo[i]*100:.1f}%-{hi[i]*100:.1f}%] "
             f"({marker}, threshold={THRESHOLDS[i]:.2f})"
         )
 
@@ -275,98 +290,173 @@ def build_ai_prompt(pred, shap_results, patient_info):
             )
 
     ci_note = (
-        "CI is population-level estimate "
-        "(not individual bootstrap CI — new patient)."
+        "CI is population-level estimate (new patient)."
         if source == 'population_estimate'
-        else "CI is individual bootstrap CI (N=50 iterations)."
+        else "CI is exact individual bootstrap CI (N=50)."
     )
 
-    return f"""Interpret the following vector-borne disease \
-probability assessment for a healthcare worker.
+    return (
+        f"Here is the full clinical assessment context.\n\n"
+        f"PATIENT INFORMATION:\n"
+        f"- Age: {patient_info.get('age', 'Unknown')}\n"
+        f"- Gender: {patient_info.get('gender', 'Unknown')}\n"
+        f"- Facility: {patient_info.get('faskes', 'Unknown')}\n\n"
+        f"MODEL OUTPUT (sorted by probability):\n"
+        f"{chr(10).join(prob_lines)}\n\n"
+        f"UNCERTAINTY:\n"
+        f"- Mean prediction std: {std:.4f}\n"
+        f"- P75 threshold: {UNC_P75:.4f}\n"
+        f"- Flag: "
+        f"{'HIGH - second opinion recommended' if unc else 'Within normal range'}\n"
+        f"- {ci_note}\n\n"
+        f"SHAP CONTRIBUTING FACTORS:\n"
+        f"{chr(10).join(shap_lines) if shap_lines else 'Not available.'}\n\n"
+        f"Please provide:\n"
+        f"### Prediction Interpretation\n"
+        f"### Recommended Clinical Actions\n"
+        f"### Key Contributing Factors (SHAP)\n\n"
+        f"After your initial response, I will ask "
+        f"follow-up questions."
+    )
 
-PATIENT INFORMATION:
-- Age: {patient_info.get('age', 'Unknown')}
-- Gender: {patient_info.get('gender', 'Unknown')}
-- Facility: {patient_info.get('faskes', 'Unknown')}
-
-MODEL OUTPUT (sorted by probability):
-{chr(10).join(prob_lines)}
-
-UNCERTAINTY:
-- Mean prediction std: {std:.4f}
-- Population P75 threshold: {UNC_P75:.4f}
-- Uncertainty flag: \
-{"HIGH — second opinion recommended" if unc else "Within normal range"}
-- {ci_note}
-
-SHAP CONTRIBUTING FACTORS (top 3 per label above threshold):
-{chr(10).join(shap_lines) if shap_lines else "Not available."}
-
-Please provide your clinical interpretation."""
-
-def render_ai_interpretation(pred, X_arr, patient_info):
+def render_ai_chat(pred, X_arr, patient_info, chat_key):
     client = get_grok_client()
     if client is None:
         st.warning(
-            "AI interpretation unavailable — "
+            "AI chat unavailable — "
             "GROQ_API_KEY not found in Streamlit secrets.")
         return
 
-    mean_p       = pred['mean']
-    above_labels = [i for i in range(5)
-                    if mean_p[i] >= THRESHOLDS[i]]
+    hist_key    = f"chat_history_{chat_key}"
+    context_key = f"chat_context_set_{chat_key}"
 
-    shap_results = {}
-    if X_arr is not None and above_labels:
-        with st.spinner("Computing SHAP for AI context..."):
-            for i in above_labels[:3]:
-                shap_results[LABELS[i]] = get_shap_top3(X_arr, i)
+    if hist_key not in st.session_state:
+        st.session_state[hist_key] = []
+    if context_key not in st.session_state:
+        st.session_state[context_key] = False
 
-    prompt = build_ai_prompt(pred, shap_results, patient_info)
-
-    st.markdown("### AI Clinical Interpretation")
+    st.markdown("### 🤖 AI Clinical Assistant")
     st.caption(
-        "Generated by Grok (xAI) · "
-        "For clinical decision support only · "
-        "Not a substitute for clinical judgment")
-    st.markdown("---")
+        "Powered by Grok 4.3 (xAI) · "
+        "Ask follow-up questions about this assessment · "
+        "For decision support only")
 
-    response_placeholder = st.empty()
-    full_response        = ""
+    col_init, col_reset = st.columns([3, 1])
 
-    try:
-        stream = client.chat.completions.create(
-            model="grok-3-fast",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
-            ],
-            max_tokens=800,
-            temperature=0.3,
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                full_response += delta
-                response_placeholder.markdown(
-                    full_response + "▌")
+    with col_init:
+        if not st.session_state[context_key]:
+            if st.button(
+                    "Start AI consultation ↗",
+                    type="primary",
+                    key=f"start_{chat_key}"):
 
-        response_placeholder.markdown(full_response)
+                mean_p       = pred['mean']
+                above_labels = [
+                    i for i in range(5)
+                    if mean_p[i] >= THRESHOLDS[i]]
+                shap_results = {}
+                if X_arr is not None and above_labels:
+                    with st.spinner("Computing SHAP..."):
+                        for i in above_labels[:3]:
+                            shap_results[LABELS[i]] = \
+                                get_shap_top3(X_arr, i)
+
+                context_msg = build_context_message(
+                    pred, shap_results, patient_info)
+
+                st.session_state[hist_key] = [
+                    {"role": "user",
+                     "content": context_msg}
+                ]
+
+                with st.spinner(
+                        "Generating initial interpretation..."):
+                    try:
+                        response = \
+                            client.chat.completions.create(
+                                model="grok-4.3",
+                                messages=[
+                                    {"role"   : "system",
+                                     "content": SYSTEM_PROMPT},
+                                ] + st.session_state[hist_key],
+                                max_tokens=800,
+                                temperature=0.3,
+                            )
+                        assistant_msg = \
+                            response.choices[0].message.content
+                        st.session_state[hist_key].append({
+                            "role"   : "assistant",
+                            "content": assistant_msg,
+                        })
+                        st.session_state[context_key] = True
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+                        return
+
+    with col_reset:
+        if st.session_state[context_key]:
+            if st.button("Reset chat",
+                         key=f"reset_{chat_key}"):
+                st.session_state[hist_key]    = []
+                st.session_state[context_key] = False
+                st.rerun()
+
+    if st.session_state[context_key]:
+        display_history = st.session_state[hist_key][1:]
+
+        for msg in display_history:
+            if msg["role"] == "assistant":
+                with st.chat_message("assistant",
+                                     avatar="⚕️"):
+                    st.markdown(msg["content"])
+            else:
+                with st.chat_message("user",
+                                     avatar="👤"):
+                    st.markdown(msg["content"])
+
+        user_input = st.chat_input(
+            "Ask a follow-up question...",
+            key=f"chat_input_{chat_key}")
+
+        if user_input:
+            st.session_state[hist_key].append({
+                "role"   : "user",
+                "content": user_input,
+            })
+
+            with st.chat_message("assistant", avatar="⚕️"):
+                response_placeholder = st.empty()
+                full_response        = ""
+                try:
+                    stream = client.chat.completions.create(
+                        model="grok-4.3",
+                        messages=[
+                            {"role"   : "system",
+                             "content": SYSTEM_PROMPT},
+                        ] + st.session_state[hist_key],
+                        max_tokens=600,
+                        temperature=0.3,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            full_response += delta
+                            response_placeholder.markdown(
+                                full_response + "▌")
+                    response_placeholder.markdown(full_response)
+                    st.session_state[hist_key].append({
+                        "role"   : "assistant",
+                        "content": full_response,
+                    })
+                except Exception as e:
+                    st.error(f"API error: {e}")
 
         st.caption(
-            "⚕️ DISCLAIMER: This AI interpretation is generated "
-            "by a large language model and is for clinical "
-            "decision support only. It does not constitute "
-            "medical advice or diagnosis. All clinical decisions "
-            "must be made by a licensed medical professional "
-            "based on full clinical assessment.")
-
-    except Exception as e:
-        st.error(f"AI interpretation error: {e}")
-        st.caption(
-            "Check GROQ_API_KEY in Streamlit secrets "
-            "and ensure sufficient API credits.")
+            "⚕️ AI responses are for clinical decision support "
+            "only. Not medical advice. Confirm all decisions "
+            "with a licensed medical professional.")
 
 # ============================================================
 # REPORT RENDERER
@@ -392,9 +482,8 @@ def render_report(pred, X_arr=None, show_shap=True,
     if source == 'population_estimate':
         st.info(
             "ℹ️ CI shown is a population-level estimate "
-            "(± 1.96 × population std from training bootstrap, "
-            "N=50). Individual bootstrap CI available in "
-            "Tab 3 for dataset patients.")
+            "(±1.96 × population std from training bootstrap). "
+            "Individual bootstrap CI available in Tab 3.")
 
     if unc_flag:
         st.warning(
@@ -403,7 +492,7 @@ def render_report(pred, X_arr=None, show_shap=True,
             f"— second opinion recommended")
     else:
         st.success(
-            f"✓ Confidence within normal population range "
+            f"✓ Confidence within normal range "
             f"(std={std:.4f})")
 
     st.markdown("**Disease probability assessment** "
@@ -468,8 +557,7 @@ def render_report(pred, X_arr=None, show_shap=True,
     if true_dx is not None:
         st.markdown("---")
         st.caption(
-            "[Evaluation only — not available in deployment] "
-            f"True diagnosis: "
+            "[Evaluation only] True diagnosis: "
             f"{', '.join(true_dx) if true_dx else 'None'}")
 
     st.markdown("---")
@@ -505,12 +593,12 @@ with st.sidebar:
     for l, s in zip(LABELS, POP_STD_LABEL):
         st.caption(f"{l}: {s:.4f}")
     st.markdown("---")
-    st.markdown("**AI Interpretation**")
+    st.markdown("**AI Assistant**")
     grok_ok = st.secrets.get("GROQ_API_KEY", None) is not None
     if grok_ok:
-        st.success("Grok AI: connected")
+        st.success("Grok 4.3: connected")
     else:
-        st.warning("Grok AI: not configured")
+        st.warning("Grok 4.3: not configured")
 
 # ============================================================
 # MAIN
@@ -551,7 +639,7 @@ with tab1:
 
     symptoms = {
         'Fièvre depuis 48 heures(Fever 48 hrs)':
-            'Fever ≥ 48h',
+            'Fever >= 48h',
         'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)':
             'Fever last 7 days',
         'Haute température.(temperature, Hyperpyrexia)':
@@ -603,16 +691,16 @@ with tab1:
     lc1, lc2, lc3 = st.columns(3)
     with lc1:
         platelet = st.number_input(
-            "Platelet count (×10³/µL)",
+            "Platelet count (x10^3/uL)",
             min_value=0, max_value=1000,
             value=150, step=1)
         wbc = st.number_input(
-            "WBC count (cells/µL)",
+            "WBC count (cells/uL)",
             min_value=0, max_value=50000,
             value=7000, step=100)
     with lc2:
         temp_val = st.number_input(
-            "Axillary temperature (°C)",
+            "Axillary temperature (C)",
             min_value=35.0, max_value=42.0,
             value=37.5, step=0.1)
         pulse = st.number_input(
@@ -644,8 +732,8 @@ with tab1:
             'Fréquence_du_pouls_battementsm_in_SD_Pul' : float(pulse),
             'Poids_Weight'                              : float(weight),
             'Âge_Age'                                   : float(age),
-            'Genre_Gender'                              : 1.0 if gender == 'Male' else 0.0,
-            'Centre_de_santé'                           : 0.0 if faskes == 'CMA de DO' else 1.0,
+            'Genre_Gender'      : 1.0 if gender == 'Male' else 0.0,
+            'Centre_de_santé'   : 0.0 if faskes == 'CMA de DO' else 1.0,
         }
         for k, v in lab_map.items():
             if k in row:
@@ -658,8 +746,10 @@ with tab1:
                 'Douleur musculaire ( Muscle pain)', False)),
         ]))
         gi_score = float(sum([
-            int(sym_vals.get('Vomissement (Vomiting)', False)),
-            int(sym_vals.get('Diarrhée  (Diarrhea)', False)),
+            int(sym_vals.get(
+                'Vomissement (Vomiting)', False)),
+            int(sym_vals.get(
+                'Diarrhée  (Diarrhea)', False)),
             int(sym_vals.get(
                 'Douleur abdominale (stomac pain)', False)),
             int(sym_vals.get('Nausée (Nausea)', False)),
@@ -718,29 +808,32 @@ with tab1:
             [[row.get(f, 0.0) for f in FEATURE_NAMES]],
             dtype=np.float32)
 
+        st.session_state['X_manual_tab1'] = X_manual
+        st.session_state['pred_tab1']     = predict_new_patient(
+            X_manual)
+        st.session_state['pinfo_tab1']    = {
+            'age'   : f"{age} years",
+            'gender': gender,
+            'faskes': faskes,
+        }
+        # Reset chat saat generate baru
+        st.session_state['chat_history_tab1']    = []
+        st.session_state['chat_context_set_tab1'] = False
+
+    # Tampilkan hasil jika sudah ada
+    if 'pred_tab1' in st.session_state:
         st.markdown("---")
         st.markdown("### Assessment result")
-
-        with st.spinner("Computing prediction..."):
-            pred = predict_new_patient(X_manual)
-
-        render_report(pred, X_arr=X_manual, show_shap=True)
-
-        # AI Interpretation
+        render_report(
+            st.session_state['pred_tab1'],
+            X_arr=st.session_state['X_manual_tab1'],
+            show_shap=True)
         st.markdown("---")
-        with st.expander(
-                "🤖 Get AI clinical interpretation",
-                expanded=False):
-            if st.button(
-                    "Generate AI interpretation ↗",
-                    key="ai_btn_manual"):
-                patient_info = {
-                    'age'   : f"{age} years",
-                    'gender': gender,
-                    'faskes': faskes,
-                }
-                render_ai_interpretation(
-                    pred, X_manual, patient_info)
+        render_ai_chat(
+            st.session_state['pred_tab1'],
+            st.session_state['X_manual_tab1'],
+            st.session_state['pinfo_tab1'],
+            chat_key="tab1")
 
 # ── TAB 2: UPLOAD CSV ─────────────────────────────────────
 with tab2:
@@ -778,6 +871,15 @@ with tab2:
                     probas_b = apply_yf_rules(
                         X_batch, probas_b, FEATURE_NAMES)
 
+                st.session_state['X_batch_tab2']   = X_batch
+                st.session_state['probas_b_tab2']  = probas_b
+
+            if ('X_batch_tab2' in st.session_state and
+                    'probas_b_tab2' in st.session_state):
+
+                X_batch  = st.session_state['X_batch_tab2']
+                probas_b = st.session_state['probas_b_tab2']
+
                 st.markdown("### Batch results summary")
                 results = pd.DataFrame(
                     (probas_b >= THRESHOLDS).astype(int),
@@ -813,7 +915,8 @@ with tab2:
                 pat_sel = st.selectbox(
                     "Select patient for detailed report",
                     range(len(df_up)),
-                    format_func=lambda x: f"Patient #{x}")
+                    format_func=lambda x: f"Patient #{x}",
+                    key="pat_sel_tab2")
 
                 pred_sel = predict_new_patient(
                     X_batch[pat_sel:pat_sel+1])
@@ -823,23 +926,14 @@ with tab2:
                     X_arr=X_batch[pat_sel:pat_sel+1],
                     show_shap=True)
 
-                # AI Interpretation
                 st.markdown("---")
-                with st.expander(
-                        "🤖 Get AI clinical interpretation",
-                        expanded=False):
-                    if st.button(
-                            "Generate AI interpretation ↗",
-                            key="ai_btn_csv"):
-                        patient_info_csv = {
-                            'age'   : 'From CSV',
-                            'gender': 'From CSV',
-                            'faskes': 'From CSV',
-                        }
-                        render_ai_interpretation(
-                            pred_sel,
-                            X_batch[pat_sel:pat_sel+1],
-                            patient_info_csv)
+                render_ai_chat(
+                    pred_sel,
+                    X_batch[pat_sel:pat_sel+1],
+                    {'age'   : 'From CSV',
+                     'gender': 'From CSV',
+                     'faskes': 'From CSV'},
+                    chat_key=f"tab2_{pat_sel}")
 
                 st.download_button(
                     "Download results CSV",
@@ -859,12 +953,11 @@ with tab3:
     st.markdown("### Dataset patient lookup")
     st.caption(
         "Look up a patient from the original 300-patient "
-        "dataset. Uses exact bootstrap CI computed in "
-        "notebook (N=50 iterations) — identical to "
-        "notebook output.")
+        "dataset. Uses exact bootstrap CI from notebook "
+        "(N=50 iterations).")
 
     pat_idx = st.number_input(
-        "Patient index (0–299)",
+        "Patient index (0-299)",
         min_value=0, max_value=299,
         value=16, step=1)
 
@@ -874,29 +967,28 @@ with tab3:
                  key="btn_lookup"):
 
         pred = predict_dataset_patient(int(pat_idx))
+        st.session_state['pred_tab3']    = pred
+        st.session_state['patidx_tab3']  = int(pat_idx)
+        # Reset chat saat lookup baru
+        st.session_state['chat_history_tab3']     = []
+        st.session_state['chat_context_set_tab3'] = False
 
-        st.markdown(f"### Report — Patient #{pat_idx}")
-        st.caption(
-            "Bootstrap CI: exact from notebook (N=50).")
+    if 'pred_tab3' in st.session_state:
+        idx_shown = st.session_state['patidx_tab3']
+        st.markdown(f"### Report — Patient #{idx_shown}")
+        st.caption("Bootstrap CI: exact from notebook (N=50).")
 
         render_report(
-            pred,
+            st.session_state['pred_tab3'],
             X_arr=None,
             show_shap=False,
             true_dx=None)
 
-        # AI Interpretation
         st.markdown("---")
-        with st.expander(
-                "🤖 Get AI clinical interpretation",
-                expanded=False):
-            if st.button(
-                    "Generate AI interpretation ↗",
-                    key="ai_btn_lookup"):
-                patient_info_ds = {
-                    'age'   : f"Patient #{pat_idx} (from dataset)",
-                    'gender': 'From dataset',
-                    'faskes': 'From dataset',
-                }
-                render_ai_interpretation(
-                    pred, None, patient_info_ds)
+        render_ai_chat(
+            st.session_state['pred_tab3'],
+            None,
+            {'age'   : f"Patient #{idx_shown}",
+             'gender': 'From dataset',
+             'faskes': 'From dataset'},
+            chat_key="tab3")
