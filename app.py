@@ -1,4 +1,5 @@
 
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,9 +9,6 @@ import re
 import shap
 from sklearn.ensemble import RandomForestClassifier
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
 st.set_page_config(
     page_title="VBD Clinical Decision Support",
     page_icon="⚕️",
@@ -32,17 +30,19 @@ def load_artifacts():
         models.append(m)
     with open('artifacts/feature_names.txt') as f:
         feat_names = [l.strip() for l in f.readlines()]
-    return models, meta, feat_names
+    boot_stats = joblib.load('artifacts/bootstrap_stats.pkl')
+    return models, meta, feat_names, boot_stats
 
-models, META, FEATURE_NAMES = load_artifacts()
+models, META, FEATURE_NAMES, BOOT_STATS = load_artifacts()
 
-LABELS     = META['target_labels']
-THRESHOLDS = np.array(META['cv_thresholds'])
-UNC_P75    = META['unc_p75']
-N_BOOT     = 30  # lebih cepat di cloud vs 50 di notebook
+LABELS          = META['target_labels']
+THRESHOLDS      = np.array(META['cv_thresholds'])
+UNC_P75         = BOOT_STATS['unc_p75']
+POP_MEAN_STD    = BOOT_STATS['pop_mean_std']
+POP_STD_LABEL   = np.array(BOOT_STATS['pop_std_per_label'])
 
 # ============================================================
-# FEATURE ENGINEERING — identik dengan notebook
+# PREPROCESSING — identik dengan notebook
 # ============================================================
 def build_fe_batch1(df):
     df = df.copy()
@@ -81,19 +81,18 @@ def build_fe_batch1(df):
         valid = [c for c in cols if c in df.columns]
         df[f'FE_{name}_score'] = df[valid].sum(axis=1)
         if name != 'fever':
-            df[f'FE_has_{name}'] = (df[f'FE_{name}_score'] >= 2).astype(int)
-
+            df[f'FE_has_{name}'] = (
+                df[f'FE_{name}_score'] >= 2).astype(int)
     df['FE_persistent_fever'] = (
         (df.get('Fièvre depuis 48 heures(Fever 48 hrs)',
                 pd.Series(0, index=df.index)) == 1) &
         (df.get('Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
                 pd.Series(0, index=df.index)) == 1)
     ).astype(int)
-
     df['Âge (Age)'] = pd.to_numeric(df['Âge (Age)'], errors='coerce')
     df['FE_is_child']       = (df['Âge (Age)'] < 18).astype(int)
-    df['FE_is_young_adult'] = ((df['Âge (Age)'] >= 18) &
-                                (df['Âge (Age)'] < 35)).astype(int)
+    df['FE_is_young_adult'] = (
+        (df['Âge (Age)'] >= 18) & (df['Âge (Age)'] < 35)).astype(int)
     df['FE_is_elderly']     = (df['Âge (Age)'] >= 60).astype(int)
     df['FE_dengue_pattern']  = df['FE_msk_score'] * df['FE_gi_score']
     df['FE_typhoid_pattern'] = df['FE_gi_score'] * (4 - df['FE_msk_score'])
@@ -118,78 +117,75 @@ def fix_cols(X):
 
 def apply_yf_rules(X_val, probas, feature_names):
     probas = probas.copy()
-    muscle_col = [c for c in feature_names
-                  if 'Muscle' in c and 'pain' in c.lower()]
-    cough_col  = [c for c in feature_names
-                  if 'Cough' in c or 'Toux' in c]
-    conv_col   = [c for c in feature_names
-                  if 'Generalised' in c]
+    fn = list(feature_names)
+    muscle_col = [c for c in fn if 'Muscle' in c and 'pain' in c.lower()]
+    cough_col  = [c for c in fn if 'Cough' in c or 'Toux' in c]
+    conv_col   = [c for c in fn if 'Generalised' in c]
     mask = np.zeros(len(X_val), dtype=bool)
-    fn   = list(feature_names)
-    if muscle_col:
-        mask |= (X_val[:, fn.index(muscle_col[0])] == 0)
-    if cough_col:
-        mask |= (X_val[:, fn.index(cough_col[0])]  == 1)
-    if conv_col:
-        mask |= (X_val[:, fn.index(conv_col[0])]   == 1)
+    if muscle_col: mask |= (X_val[:, fn.index(muscle_col[0])] == 0)
+    if cough_col:  mask |= (X_val[:, fn.index(cough_col[0])]  == 1)
+    if conv_col:   mask |= (X_val[:, fn.index(conv_col[0])]   == 1)
     probas[mask, 2] = 0.0
     return probas
 
 def preprocess_df(df):
-    """Full preprocessing pipeline — identik dengan notebook."""
     df = build_fe_batch1(df)
     drop_cols = [c for c in df.columns
-                 if c in META['target_cols'] + ['Dengue (Dengua)', 'n_diseases']]
+                 if c in META['target_cols'] +
+                 ['Dengue (Dengua)', 'n_diseases']]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     df = fix_cols(df)
-    # Align ke feature names dari training
     for col in FEATURE_NAMES:
         if col not in df.columns:
             df[col] = 0
-    df = df[FEATURE_NAMES]
-    return df.fillna(0).astype(np.float32)
+    return df[FEATURE_NAMES].fillna(0).astype(np.float32)
 
 # ============================================================
 # PREDICTION ENGINE
 # ============================================================
-def predict_with_bootstrap(X_arr, n_boot=N_BOOT, seed=456):
-    """Bootstrap CI — identik dengan notebook."""
-    np.random.seed(seed)
-    boot_probas = np.zeros((n_boot, len(X_arr), 5))
-    for b in range(n_boot):
-        boot_idx = np.random.choice(len(X_arr), len(X_arr), replace=True)
-        X_boot   = X_arr[boot_idx]
-        for i, m in enumerate(models):
-            m_b = RandomForestClassifier(
-                **{k: v for k, v in META['rf_params'].items()},
-                class_weight='balanced',
-                random_state=seed + b,
-                n_jobs=-1
-            )
-            m_b.fit(X_boot,
-                    m.predict(X_arr))
-            boot_probas[b, :, i] = m_b.predict_proba(X_arr)[:, 1]
+def predict_dataset_patient(patient_idx):
+    """
+    Untuk pasien dari dataset (0-299):
+    gunakan bootstrap stats yang sudah dicompute di notebook.
+    Ini identik dengan output notebook.
+    """
+    return {
+        'mean'    : BOOT_STATS['mean'][patient_idx],
+        'std'     : BOOT_STATS['std'][patient_idx].mean(),
+        'lower'   : BOOT_STATS['lower'][patient_idx],
+        'upper'   : BOOT_STATS['upper'][patient_idx],
+        'source'  : 'bootstrap_notebook',
+    }
 
-    mean_p  = boot_probas.mean(axis=0)
-    std_p   = boot_probas.std(axis=0)
-    lo_p    = np.percentile(boot_probas, 2.5,  axis=0)
-    hi_p    = np.percentile(boot_probas, 97.5, axis=0)
+def predict_new_patient(X_arr):
+    """
+    Untuk pasien baru (manual input / upload CSV):
+    - Point estimate dari model RF (identik dengan notebook)
+    - CI = point_estimate ± 1.96 × pop_std_per_label
+      (population-level estimate dari bootstrap notebook)
+    - Uncertainty = pop_mean_std sebagai proxy
 
-    mean_p = apply_yf_rules(X_arr, mean_p, FEATURE_NAMES)
-    lo_p   = apply_yf_rules(X_arr, lo_p,   FEATURE_NAMES)
-    hi_p   = apply_yf_rules(X_arr, hi_p,   FEATURE_NAMES)
-
-    return mean_p, std_p, lo_p, hi_p
-
-def predict_single(X_arr):
-    """Fast single prediction tanpa bootstrap."""
+    Catatan: CI ini adalah population-level estimate,
+    bukan individual bootstrap CI. Ini adalah keterbatasan
+    yang diakui karena data training tidak di-ship ke app.
+    """
     probas = np.column_stack([
         m.predict_proba(X_arr)[:, 1] for m in models
     ])
-    return apply_yf_rules(X_arr, probas, FEATURE_NAMES)
+    probas = apply_yf_rules(X_arr, probas, FEATURE_NAMES)
+
+    lower = np.clip(probas - 1.96 * POP_STD_LABEL, 0, 1)
+    upper = np.clip(probas + 1.96 * POP_STD_LABEL, 0, 1)
+
+    return {
+        'mean'  : probas[0],
+        'std'   : POP_MEAN_STD,
+        'lower' : lower[0],
+        'upper' : upper[0],
+        'source': 'population_estimate',
+    }
 
 def get_shap_top3(X_arr, label_idx):
-    """SHAP top 3 features untuk satu label."""
     exp = shap.TreeExplainer(models[label_idx])
     sv  = exp.shap_values(X_arr)
     if isinstance(sv, list):
@@ -212,31 +208,38 @@ ACTIONS = {
     'Others'       : 'Investigate further',
 }
 
-def render_report(mean_p, std_p, lo_p, hi_p, pat_idx=0,
-                  X_arr=None, show_shap=True):
-    probs  = mean_p[pat_idx]
-    lo     = lo_p[pat_idx]
-    hi     = hi_p[pat_idx]
-    std    = std_p[pat_idx].mean()
+def render_report(pred, X_arr=None, show_shap=True,
+                  true_dx=None):
+    mean_p   = pred['mean']
+    lo       = pred['lower']
+    hi       = pred['upper']
+    std      = pred['std']
+    source   = pred['source']
     unc_flag = std > UNC_P75
+
+    # CI source note
+    if source == 'population_estimate':
+        st.info(
+            "ℹ️ CI shown is a population-level estimate "
+            "(± 1.96 × population std from training bootstrap). "
+            "Individual bootstrap CI not available for new patients.")
 
     # Uncertainty banner
     if unc_flag:
         st.warning(
-            f"⚠️ High uncertainty (std={std:.4f} > P75={UNC_P75:.4f}) "
-            f"— second opinion recommended")
+            f"⚠️ High uncertainty (std={std:.4f} > P75={UNC_P75:.4f})"
+            f" — second opinion recommended")
     else:
         st.success(
             f"✓ Confidence within normal range (std={std:.4f})")
 
-    # Disease probability table
-    st.markdown("**Disease probability assessment** "
-                "(95% Bootstrap CI, N=30)")
-    sorted_idx = np.argsort(probs)[::-1]
+    # Disease rows
+    st.markdown("**Disease probability assessment**")
+    sorted_idx = np.argsort(mean_p)[::-1]
 
     for i in sorted_idx:
         label  = LABELS[i]
-        prob   = probs[i]
+        prob   = mean_p[i]
         above  = prob >= THRESHOLDS[i]
         marker = "●" if above else "○"
         color  = COLORS[i]
@@ -251,7 +254,8 @@ def render_report(mean_p, std_p, lo_p, hi_p, pat_idx=0,
         with col2:
             st.progress(float(prob))
             st.caption(
-                f"{prob*100:.1f}% [{lo[i]*100:.1f}–{hi[i]*100:.1f}%]")
+                f"{prob*100:.1f}% "
+                f"[{lo[i]*100:.1f}–{hi[i]*100:.1f}%]")
         with col3:
             if above:
                 st.error(f"→ {action}")
@@ -259,21 +263,20 @@ def render_report(mean_p, std_p, lo_p, hi_p, pat_idx=0,
                 st.info("→ Monitor")
 
     st.caption(
-        f"Threshold per label: "
+        "Thresholds (median 5-fold CV): "
         + " | ".join([f"{l[:3]}={t:.2f}"
                       for l, t in zip(LABELS, THRESHOLDS)]))
 
     # SHAP
     if show_shap and X_arr is not None:
         above_labels = [i for i in range(5)
-                        if probs[i] >= THRESHOLDS[i]]
+                        if mean_p[i] >= THRESHOLDS[i]]
         if above_labels:
             st.markdown("---")
-            st.markdown("**Top contributing factors** "
-                        "(labels above threshold)")
+            st.markdown("**Top contributing factors**")
             for i in above_labels[:3]:
                 with st.expander(
-                        f"{LABELS[i]} — {probs[i]*100:.1f}%",
+                        f"{LABELS[i]} — {mean_p[i]*100:.1f}%",
                         expanded=True):
                     top3 = get_shap_top3(X_arr, i)
                     for feat, sv, fv in top3:
@@ -281,15 +284,22 @@ def render_report(mean_p, std_p, lo_p, hi_p, pat_idx=0,
                                     else "↓ decreases"
                         color_sv  = "red" if sv > 0 else "blue"
                         st.markdown(
-                            f"`{feat}` &nbsp; val=**{fv:.2f}** &nbsp; "
-                            f"<span style='color:{color_sv}'>"
+                            f"`{feat}` &nbsp; val=**{fv:.2f}**"
+                            f" &nbsp; <span style='color:{color_sv}'>"
                             f"SHAP={sv:+.4f} {direction}</span>",
                             unsafe_allow_html=True)
 
+    # Ground truth
+    if true_dx is not None:
+        st.markdown("---")
+        st.caption(
+            f"[Evaluation only] True diagnosis: "
+            f"{', '.join(true_dx) if true_dx else 'None'}")
+
     st.caption(
-        "⚕️ This output is for clinical decision support only. "
-        "Final diagnosis must be confirmed by a licensed medical "
-        "professional.")
+        "⚕️ For clinical decision support only. "
+        "Final diagnosis must be confirmed by a licensed "
+        "medical professional.")
 
 # ============================================================
 # SIDEBAR
@@ -299,54 +309,51 @@ with st.sidebar:
     st.caption("Vector-Borne Disease\nClinical Decision Support")
     st.markdown("---")
     st.markdown("**Model info**")
-    st.caption(f"Algorithm: Random Forest (Binary Relevance)")
-    st.caption(f"CV F1 Macro: 0.6272 ± 0.0376")
-    st.caption(f"Dataset: N=300, Burkina Faso")
-    st.caption(f"Labels: {', '.join(LABELS)}")
+    st.caption("Algorithm: Random Forest (Binary Relevance)")
+    st.caption("CV F1 Macro: 0.6272 ± 0.0376")
+    st.caption("Dataset: N=300, Burkina Faso")
     st.markdown("---")
     st.markdown("**Thresholds (median 5-fold CV)**")
     for l, t in zip(LABELS, THRESHOLDS):
         st.caption(f"{l}: {t:.2f}")
     st.markdown("---")
-    use_bootstrap = st.checkbox(
-        "Enable bootstrap CI (slower)", value=False)
-    st.caption(
-        "Bootstrap N=30 iterations. "
-        "Disable for faster predictions.")
+    st.markdown("**Uncertainty**")
+    st.caption(f"P75 threshold: {UNC_P75:.4f}")
+    st.caption(f"Pop mean std: {POP_MEAN_STD:.4f}")
 
 # ============================================================
-# MAIN TABS
+# MAIN
 # ============================================================
 st.title("Vector-Borne Disease")
 st.subheader("Clinical Decision Support System")
 st.caption(
-    "Multi-label prediction of co-infections: "
-    "Malaria, Dengue, Yellow Fever, Typhoid, Others")
+    "Multi-label prediction · Malaria · Dengue · "
+    "Yellow Fever · Typhoid · Others")
 st.markdown("---")
 
-tab1, tab2 = st.tabs(["📋 Manual input", "📁 Upload CSV"])
+tab1, tab2, tab3 = st.tabs([
+    "📋 Manual input",
+    "📁 Upload CSV",
+    "🔍 Dataset patient lookup",
+])
 
 # ── TAB 1: MANUAL INPUT ───────────────────────────────────
 with tab1:
     st.markdown("### Patient information")
-
     col1, col2, col3 = st.columns(3)
     with col1:
         age = st.number_input(
-            "Age (years)", min_value=0, max_value=120,
-            value=25, step=1)
+            "Age (years)", min_value=0,
+            max_value=120, value=25, step=1)
     with col2:
         gender = st.selectbox(
             "Gender", ["Male", "Female"], index=0)
     with col3:
         faskes = st.selectbox(
-            "Facility", ["CMA de DO", "CMA de DAFRA"], index=0)
+            "Facility",
+            ["CMA de DO", "CMA de DAFRA"], index=0)
 
     st.markdown("### Clinical symptoms")
-    st.caption("Check all symptoms present in this patient")
-
-    # Symptom groups — sesuai dengan dataset
-    symptom_cols = st.columns(3)
     symptoms = {
         'Fièvre depuis 48 heures(Fever 48 hrs)':
             'Fever ≥ 48h',
@@ -386,237 +393,218 @@ with tab1:
             'Consciousness trouble',
     }
 
-    symptom_vals = {}
-    sym_list     = list(symptoms.items())
-    n_per_col    = len(sym_list) // 3 + 1
-    for ci, col in enumerate(symptom_cols):
+    sym_cols = st.columns(3)
+    sym_vals = {}
+    sym_list = list(symptoms.items())
+    n_per    = len(sym_list) // 3 + 1
+    for ci, col in enumerate(sym_cols):
         with col:
-            for orig, label in sym_list[ci*n_per_col:(ci+1)*n_per_col]:
-                symptom_vals[orig] = st.checkbox(label, key=f"sym_{orig}")
+            for orig, label in sym_list[ci*n_per:(ci+1)*n_per]:
+                sym_vals[orig] = st.checkbox(label, key=f"s_{ci}_{orig[:20]}")
 
     st.markdown("### Lab values (optional)")
-    lab_col1, lab_col2, lab_col3 = st.columns(3)
-    with lab_col1:
+    lc1, lc2, lc3 = st.columns(3)
+    with lc1:
         platelet = st.number_input(
-            "Platelet count (×10³/µL)",
-            min_value=0, max_value=1000,
-            value=150, step=1)
+            "Platelet (×10³/µL)", 0, 1000, 150, 1)
         wbc = st.number_input(
-            "WBC count (cells/µL)",
-            min_value=0, max_value=50000,
-            value=7000, step=100)
-    with lab_col2:
+            "WBC (cells/µL)", 0, 50000, 7000, 100)
+    with lc2:
         temp = st.number_input(
-            "Axillary temperature (°C)",
-            min_value=35.0, max_value=42.0,
-            value=37.5, step=0.1)
+            "Temperature (°C)", 35.0, 42.0, 37.5, 0.1)
         pulse = st.number_input(
-            "Pulse rate (bpm)",
-            min_value=40, max_value=200,
-            value=80, step=1)
-    with lab_col3:
+            "Pulse (bpm)", 40, 200, 80, 1)
+    with lc3:
         weight = st.number_input(
-            "Weight (kg)",
-            min_value=1, max_value=150,
-            value=60, step=1)
+            "Weight (kg)", 1, 150, 60, 1)
 
-    if st.button("Generate assessment", type="primary",
+    if st.button("Generate assessment",
+                 type="primary",
                  use_container_width=True):
 
-        # Build row dari input manual
-        row = {col: 0 for col in FEATURE_NAMES}
+        row = {col: 0.0 for col in FEATURE_NAMES}
 
-        # Isi symptom values
-        for orig_col, val in symptom_vals.items():
+        for orig_col, val in sym_vals.items():
             clean = clean_colname(orig_col)
             if clean in row:
-                row[clean] = int(val)
+                row[clean] = float(int(val))
 
-        # Isi lab values
         lab_map = {
-            'Numération_plaquettaire_Platelet_count'    : platelet,
-            'Nombre_de_globules_blancs_cellulesML_Whi'  : wbc,
-            'Température_axillaire_médiane_IQR_C_Axil'  : temp,
-            'Fréquence_du_pouls_battementsm_in_SD_Pul'  : pulse,
-            'Poids_Weight'                               : weight,
-            'Âge_Age'                                    : age,
-            'Genre_Gender'                               : 1 if gender == 'Male' else 0,
-            'Centre_de_santé'                            : 0 if faskes == 'CMA de DO' else 1,
+            'Numération_plaquettaire_Platelet_count'   : float(platelet),
+            'Nombre_de_globules_blancs_cellulesML_Whi' : float(wbc),
+            'Température_axillaire_médiane_IQR_C_Axil' : float(temp),
+            'Fréquence_du_pouls_battementsm_in_SD_Pul' : float(pulse),
+            'Poids_Weight'                              : float(weight),
+            'Âge_Age'                                   : float(age),
+            'Genre_Gender'                              : 1.0 if gender == 'Male' else 0.0,
+            'Centre_de_santé'                           : 0.0 if faskes == 'CMA de DO' else 1.0,
         }
         for k, v in lab_map.items():
             if k in row:
-                row[k] = float(v)
+                row[k] = v
 
-        # FE scores manual
-        neuro_feats = [
-            'Convulsions_généralisées_ou_focales_Gen',
-            'Prostration',
-        ]
-        row['FE_msk_score'] = sum([
-            int(symptom_vals.get(
-                'Douleur articulaire (Joint pain)', False)),
-            int(symptom_vals.get(
-                'Douleur musculaire ( Muscle pain)', False)),
-        ])
-        row['FE_gi_score'] = sum([
-            int(symptom_vals.get('Vomissement (Vomiting)', False)),
-            int(symptom_vals.get('Diarrhée  (Diarrhea)', False)),
-            int(symptom_vals.get(
-                'Douleur abdominale (stomac pain)', False)),
-            int(symptom_vals.get('Nausée (Nausea)', False)),
-        ])
-        row['FE_resp_score'] = sum([
-            int(symptom_vals.get('Toux (Cough)', False)),
-            int(symptom_vals.get(
+        row['FE_msk_score'] = float(sum([
+            int(sym_vals.get('Douleur articulaire (Joint pain)', False)),
+            int(sym_vals.get('Douleur musculaire ( Muscle pain)', False)),
+        ]))
+        row['FE_gi_score'] = float(sum([
+            int(sym_vals.get('Vomissement (Vomiting)', False)),
+            int(sym_vals.get('Diarrhée  (Diarrhea)', False)),
+            int(sym_vals.get('Douleur abdominale (stomac pain)', False)),
+            int(sym_vals.get('Nausée (Nausea)', False)),
+        ]))
+        row['FE_resp_score'] = float(sum([
+            int(sym_vals.get('Toux (Cough)', False)),
+            int(sym_vals.get(
                 'Détresse respiratoire (Respiratory distress)', False)),
-        ])
-        row['FE_fever_score'] = sum([
-            int(symptom_vals.get(
+        ]))
+        row['FE_fever_score'] = float(sum([
+            int(sym_vals.get(
                 'Haute température.(temperature, Hyperpyrexia)', False)),
-            int(symptom_vals.get(
+            int(sym_vals.get(
                 'Fièvre depuis 48 heures(Fever 48 hrs)', False)),
-            int(symptom_vals.get(
+            int(sym_vals.get(
                 'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
                 False)),
-        ])
-        row['FE_dengue_pattern'] = (row['FE_msk_score'] *
-                                    row['FE_gi_score'])
-        row['FE_typhoid_pattern'] = (row['FE_gi_score'] *
-                                     (4 - row['FE_msk_score']))
-        row['FE_others_pattern']  = (row['FE_resp_score'] * 2 -
-                                     row['FE_msk_score'])
-        row['FE_is_child']        = int(age < 18)
-        row['FE_is_young_adult']  = int(18 <= age < 35)
-        row['FE_is_elderly']      = int(age >= 60)
-        row['FE_persistent_fever'] = int(
-            symptom_vals.get(
-                'Fièvre depuis 48 heures(Fever 48 hrs)', False) and
-            symptom_vals.get(
+        ]))
+        row['FE_dengue_pattern']  = row['FE_msk_score'] * row['FE_gi_score']
+        row['FE_typhoid_pattern'] = row['FE_gi_score'] * (4 - row['FE_msk_score'])
+        row['FE_others_pattern']  = row['FE_resp_score'] * 2 - row['FE_msk_score']
+        row['FE_is_child']        = float(age < 18)
+        row['FE_is_young_adult']  = float(18 <= age < 35)
+        row['FE_is_elderly']      = float(age >= 60)
+        row['FE_persistent_fever'] = float(
+            sym_vals.get('Fièvre depuis 48 heures(Fever 48 hrs)', False)
+            and sym_vals.get(
                 'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)',
                 False))
-        row['FE_has_msk']  = int(row['FE_msk_score']  >= 2)
-        row['FE_has_gi']   = int(row['FE_gi_score']   >= 2)
-        row['FE_has_resp'] = int(row['FE_resp_score']  >= 2)
-        row['FE_has_neuro'] = int(sum([
-            int(symptom_vals.get(
+        row['FE_has_msk']   = float(row['FE_msk_score']  >= 2)
+        row['FE_has_gi']    = float(row['FE_gi_score']   >= 2)
+        row['FE_has_resp']  = float(row['FE_resp_score'] >= 2)
+        row['FE_has_neuro'] = float(sum([
+            int(sym_vals.get(
                 'Convulsions généralisées ou focales (Generalised or focal convulsion)',
                 False)),
-            int(symptom_vals.get('Prostration', False)),
+            int(sym_vals.get('Prostration', False)),
         ]) >= 2)
 
         X_manual = np.array(
-            [[row.get(f, 0) for f in FEATURE_NAMES]],
+            [[row.get(f, 0.0) for f in FEATURE_NAMES]],
             dtype=np.float32)
 
         st.markdown("---")
         st.markdown("### Assessment result")
-
         with st.spinner("Computing prediction..."):
-            if use_bootstrap:
-                with st.spinner(
-                        f"Running bootstrap CI ({N_BOOT} iter)..."):
-                    mean_p, std_p, lo_p, hi_p = \
-                        predict_with_bootstrap(X_manual)
-            else:
-                probas = predict_single(X_manual)
-                mean_p = probas
-                std_p  = np.zeros_like(probas)
-                lo_p   = probas
-                hi_p   = probas
-
-        render_report(
-            mean_p, std_p, lo_p, hi_p,
-            pat_idx=0, X_arr=X_manual,
-            show_shap=True)
+            pred = predict_new_patient(X_manual)
+        render_report(pred, X_arr=X_manual, show_shap=True)
 
 # ── TAB 2: UPLOAD CSV ─────────────────────────────────────
 with tab2:
     st.markdown("### Upload patient CSV")
     st.caption(
-        "Upload a CSV file with the same column format as the "
-        "original dataset (French column names). "
-        "Missing columns will be filled with 0.")
+        "CSV with French column names matching the original dataset. "
+        "Missing columns are filled with 0.")
 
-    uploaded = st.file_uploader(
-        "Choose CSV file", type=['csv'])
+    uploaded = st.file_uploader("Choose CSV file", type=['csv'])
 
     if uploaded is not None:
         try:
-            df_upload = pd.read_csv(uploaded)
+            df_up = pd.read_csv(uploaded)
             st.success(
-                f"Loaded {len(df_upload)} patients, "
-                f"{len(df_upload.columns)} columns")
+                f"Loaded {len(df_up)} patients, "
+                f"{len(df_up.columns)} columns")
 
-            with st.expander("Preview data", expanded=False):
-                st.dataframe(df_upload.head(5))
+            with st.expander("Preview", expanded=False):
+                st.dataframe(df_up.head(5))
 
             if st.button("Run batch assessment",
                          type="primary",
                          use_container_width=True):
 
-                with st.spinner("Preprocessing..."):
-                    X_batch = preprocess_df(df_upload).values
+                with st.spinner("Preprocessing & predicting..."):
+                    X_batch  = preprocess_df(df_up).values
+                    probas_b = np.column_stack([
+                        m.predict_proba(X_batch)[:, 1]
+                        for m in models
+                    ])
+                    probas_b = apply_yf_rules(
+                        X_batch, probas_b, FEATURE_NAMES)
 
-                with st.spinner("Predicting..."):
-                    probas_batch = predict_single(X_batch)
-                    mean_p = probas_batch
-                    std_p  = np.zeros_like(probas_batch)
-                    lo_p   = probas_batch
-                    hi_p   = probas_batch
-
-                # Summary table
-                st.markdown("### Batch results summary")
+                st.markdown("### Batch results")
                 results = pd.DataFrame(
-                    (mean_p >= THRESHOLDS).astype(int),
+                    (probas_b >= THRESHOLDS).astype(int),
                     columns=LABELS)
-                results.insert(0, 'Patient', range(len(df_upload)))
-                results['n_diseases'] = results[LABELS].sum(axis=1)
-                results['max_prob_label'] = [
-                    LABELS[np.argmax(mean_p[i])]
-                    for i in range(len(mean_p))]
-                results['max_prob'] = mean_p.max(axis=1).round(3)
+                results.insert(0, 'Patient',
+                                range(len(df_up)))
+                results['n_diseases'] = \
+                    results[LABELS].sum(axis=1)
+                results['top_label'] = [
+                    LABELS[np.argmax(probas_b[i])]
+                    for i in range(len(probas_b))]
+                results['top_prob'] = \
+                    probas_b.max(axis=1).round(3)
 
-                st.dataframe(results, use_container_width=True)
+                st.dataframe(results,
+                             use_container_width=True)
 
-                # Summary stats
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total patients", len(df_upload))
-                with col2:
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Total", len(df_up))
+                with c2:
                     n_co = (results['n_diseases'] >= 2).sum()
-                    st.metric("Co-infections", n_co,
-                              f"{n_co/len(df_upload)*100:.1f}%")
-                with col3:
-                    n_mal = results['Malaria'].sum()
-                    st.metric("Malaria predicted", n_mal)
-                with col4:
-                    n_yf = results['Yellow Fever'].sum()
-                    st.metric("Yellow Fever predicted", n_yf)
+                    st.metric("Co-infections", n_co)
+                with c3:
+                    st.metric("Malaria",
+                              results['Malaria'].sum())
+                with c4:
+                    st.metric("Yellow Fever",
+                              results['Yellow Fever'].sum())
 
-                # Per-patient detail
                 st.markdown("### Per-patient detail")
                 pat_sel = st.selectbox(
-                    "Select patient for detailed report",
-                    options=range(len(df_upload)),
+                    "Select patient",
+                    range(len(df_up)),
                     format_func=lambda x: f"Patient #{x}")
 
+                pred_sel = predict_new_patient(
+                    X_batch[pat_sel:pat_sel+1])
                 render_report(
-                    mean_p, std_p, lo_p, hi_p,
-                    pat_idx=pat_sel,
+                    pred_sel,
                     X_arr=X_batch[pat_sel:pat_sel+1],
                     show_shap=True)
 
-                # Download results
-                csv_out = results.to_csv(index=False)
                 st.download_button(
                     "Download results CSV",
-                    data=csv_out,
+                    data=results.to_csv(index=False),
                     file_name="vbd_cdss_results.csv",
                     mime="text/csv",
                     use_container_width=True)
 
         except Exception as e:
-            st.error(f"Error processing file: {e}")
-            st.caption(
-                "Pastikan format CSV sesuai dengan dataset asli "
-                "(French column names).")
+            st.error(f"Error: {e}")
+
+# ── TAB 3: DATASET PATIENT LOOKUP ─────────────────────────
+with tab3:
+    st.markdown("### Dataset patient lookup")
+    st.caption(
+        "Lookup a patient from the original 300-patient dataset. "
+        "Uses exact bootstrap CI from notebook (N=50 iterations).")
+
+    pat_idx = st.number_input(
+        "Patient index (0–299)",
+        min_value=0, max_value=299, value=16, step=1)
+
+    if st.button("Lookup patient",
+                 type="primary",
+                 use_container_width=True):
+
+        pred = predict_dataset_patient(pat_idx)
+
+        st.markdown(f"### Report — Patient #{pat_idx}")
+        st.caption("Bootstrap CI: exact from notebook (N=50)")
+
+        render_report(pred, X_arr=None, show_shap=False)
+
+        st.info(
+            "SHAP not shown for dataset lookup — "
+            "enable by loading X_arr in app if needed.")
