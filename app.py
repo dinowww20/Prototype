@@ -1,3 +1,7 @@
+# ============================================================
+# app.py — Vector-Borne Disease CDSS
+# Streamlit Cloud Deployment — Enhanced UI
+# ============================================================
 
 import streamlit as st
 import pandas as pd
@@ -6,6 +10,8 @@ import joblib
 import json
 import re
 import shap
+import plotly.graph_objects as go
+import plotly.express as px
 from groq import Groq
 
 st.set_page_config(
@@ -14,6 +20,121 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ============================================================
+# CUSTOM CSS
+# ============================================================
+st.markdown("""
+<style>
+/* Font & base */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+/* Header */
+.main-header {
+    background: linear-gradient(135deg, #1e3a5f 0%, #2d6a9f 100%);
+    padding: 24px 32px; border-radius: 12px;
+    color: white; margin-bottom: 24px;
+}
+.main-header h1 { font-size: 26px; font-weight: 700;
+    margin: 0; color: white; }
+.main-header p  { font-size: 14px; opacity: 0.85;
+    margin: 4px 0 0 0; }
+
+/* Cards */
+.metric-card {
+    background: white; border: 1px solid #e2e8f0;
+    border-radius: 10px; padding: 16px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+.metric-card .label {
+    font-size: 12px; color: #64748b;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    font-weight: 600;
+}
+.metric-card .value {
+    font-size: 22px; font-weight: 700; color: #1e293b;
+    margin-top: 4px;
+}
+
+/* Disease row */
+.disease-card {
+    background: white; border: 1px solid #e2e8f0;
+    border-radius: 10px; padding: 14px 18px;
+    margin-bottom: 8px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    transition: all 0.2s;
+}
+.disease-card.above {
+    border-left: 4px solid #ef4444;
+    background: #fff8f8;
+}
+.disease-card .dis-name {
+    font-size: 14px; font-weight: 600; color: #1e293b;
+}
+.disease-card .dis-prob {
+    font-size: 20px; font-weight: 700;
+}
+.disease-card .dis-ci {
+    font-size: 12px; color: #64748b;
+}
+.disease-card .action-badge {
+    display: inline-block; padding: 4px 10px;
+    border-radius: 99px; font-size: 12px;
+    font-weight: 600;
+}
+.action-treat  { background: #fee2e2; color: #991b1b; }
+.action-monitor{ background: #f1f5f9; color: #475569; }
+
+/* SHAP bar */
+.shap-feat { font-size: 12px; color: #475569;
+    font-family: monospace; }
+.shap-val-pos { color: #dc2626; font-weight: 600; }
+.shap-val-neg { color: #2563eb; font-weight: 600; }
+
+/* Section header */
+.section-header {
+    font-size: 15px; font-weight: 600; color: #1e293b;
+    margin: 20px 0 12px 0; padding-bottom: 6px;
+    border-bottom: 2px solid #e2e8f0;
+}
+
+/* Uncertainty banner */
+.unc-high {
+    background: #fef3c7; border: 1px solid #f59e0b;
+    border-radius: 8px; padding: 10px 14px;
+    font-size: 13px; color: #92400e;
+    margin-bottom: 12px;
+}
+.unc-ok {
+    background: #d1fae5; border: 1px solid #10b981;
+    border-radius: 8px; padding: 10px 14px;
+    font-size: 13px; color: #065f46;
+    margin-bottom: 12px;
+}
+
+/* Disclaimer */
+.disclaimer {
+    background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 8px; padding: 10px 14px;
+    font-size: 12px; color: #64748b;
+    margin-top: 16px;
+}
+
+/* Chat */
+.chat-container {
+    background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 12px; padding: 16px;
+}
+
+/* Checklist */
+.confirm-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 0; font-size: 13px;
+    border-bottom: 1px solid #f1f5f9;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # LOAD ARTIFACTS
@@ -40,6 +161,8 @@ UNC_P75       = META['unc_p75']
 POP_MEAN_STD  = BOOT_STATS['pop_mean_std']
 POP_STD_LABEL = np.array(BOOT_STATS['pop_std_per_label'])
 
+COLORS_HEX = ['#ef4444','#3b82f6','#f59e0b','#10b981','#8b5cf6']
+
 # ============================================================
 # GROQ AI CLIENT
 # ============================================================
@@ -59,39 +182,27 @@ The AI model is a Binary Relevance Random Forest trained on \
 300 patients from two health facilities (CMA de DO and \
 CMA de DAFRA). It predicts probabilities for 5 diseases: \
 Malaria, Dengue, Yellow Fever, Typhoid, and Others.
-Model CV F1 Macro: 0.6272 plus-minus 0.0376 (5-fold CV, N=300).
-
-The user is a healthcare worker. You have been provided with
-the full assessment context in the first message. Use it
-as the basis for all your answers.
+Model CV F1 Macro: 0.6272 ± 0.0376 (5-fold CV, N=300).
 
 You MUST follow these rules strictly:
 1. Always frame output as probability-based decision support,
    never as definitive diagnosis.
 2. Always recommend confirmation by a licensed medical
-   professional through clinical examination and lab tests.
-3. Use precise clinical language appropriate for healthcare
-   professionals.
+   professional.
+3. Use precise clinical language for healthcare professionals.
 4. Reference specific probability values from the context.
 5. Acknowledge model uncertainty when flagged as HIGH.
-6. When explaining SHAP values, explain in plain clinical
-   terms what the feature means clinically.
-7. Answer follow-up questions concisely and accurately.
-8. If asked something outside the scope of the assessment,
-   politely redirect to the clinical context.
+6. Explain SHAP values in plain clinical terms.
+7. Answer follow-up questions concisely.
 
 You MUST NOT:
-1. State that a patient has or is diagnosed with a disease.
+1. State a patient has or is diagnosed with a disease.
 2. Provide specific drug dosages or treatment regimens.
 3. Override or contradict the model probability outputs.
-4. Make clinical claims beyond what the model evidence supports.
-
-Always remind the user that your output is for clinical
-decision support only and not a substitute for clinical
-judgment when relevant."""
+4. Make claims beyond what the model evidence supports."""
 
 # ============================================================
-# PREPROCESSING — identik dengan notebook
+# PREPROCESSING
 # ============================================================
 def build_fe_batch1(df):
     df = df.copy()
@@ -239,7 +350,348 @@ def get_shap_top3(X_arr, label_idx):
              float(X_arr[0, i])) for i in top3]
 
 # ============================================================
-# AI CHAT HELPERS
+# VISUALIZATIONS
+# ============================================================
+def plot_radar(mean_p):
+    """Radar chart perbandingan 5 penyakit."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=[float(mean_p[i]) * 100 for i in range(5)] +
+          [float(mean_p[0]) * 100],
+        theta=LABELS + [LABELS[0]],
+        fill='toself',
+        fillcolor='rgba(99,102,241,0.15)',
+        line=dict(color='#6366f1', width=2),
+        name='Probability %'
+    ))
+    # Threshold line
+    fig.add_trace(go.Scatterpolar(
+        r=[float(THRESHOLDS[i]) * 100
+           for i in range(5)] + [float(THRESHOLDS[0]) * 100],
+        theta=LABELS + [LABELS[0]],
+        fill='none',
+        line=dict(color='#ef4444', width=1.5,
+                  dash='dash'),
+        name='Threshold'
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True, range=[0, 100],
+                ticksuffix='%', tickfont=dict(size=10),
+                gridcolor='#e2e8f0',
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=11, color='#374151')
+            ),
+            bgcolor='white',
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation='h', yanchor='bottom',
+            y=-0.15, xanchor='center', x=0.5,
+            font=dict(size=11)
+        ),
+        margin=dict(l=40, r=40, t=20, b=40),
+        height=320,
+        paper_bgcolor='white',
+        plot_bgcolor='white',
+    )
+    return fig
+
+def plot_gauge(prob, threshold, label, color):
+    """Gauge chart untuk satu label."""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=prob * 100,
+        number=dict(suffix="%", font=dict(size=22,
+                    color='#1e293b')),
+        gauge=dict(
+            axis=dict(
+                range=[0, 100],
+                tickwidth=1,
+                tickcolor='#94a3b8',
+                tickfont=dict(size=9),
+            ),
+            bar=dict(color=color, thickness=0.6),
+            bgcolor='#f8fafc',
+            borderwidth=1,
+            bordercolor='#e2e8f0',
+            steps=[
+                dict(range=[0, threshold*100],
+                     color='#f1f5f9'),
+                dict(range=[threshold*100, 100],
+                     color='#fee2e2'),
+            ],
+            threshold=dict(
+                line=dict(color='#ef4444', width=2),
+                thickness=0.8,
+                value=threshold * 100
+            )
+        ),
+        title=dict(text=label[:8],
+                   font=dict(size=12, color='#374151'))
+    ))
+    fig.update_layout(
+        height=160,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor='white',
+    )
+    return fig
+
+def plot_shap_bar(top3, label, color):
+    """Horizontal bar chart untuk SHAP values."""
+    feats = [f[0][:30] for f in top3]
+    vals  = [f[1] for f in top3]
+    colors = ['#ef4444' if v > 0 else '#3b82f6' for v in vals]
+
+    fig = go.Figure(go.Bar(
+        x=vals[::-1],
+        y=feats[::-1],
+        orientation='h',
+        marker_color=colors[::-1],
+        marker_line_width=0,
+        text=[f'{v:+.4f}' for v in vals[::-1]],
+        textposition='outside',
+        textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title=dict(text=f'SHAP — {label}',
+                   font=dict(size=12, color='#374151')),
+        xaxis=dict(
+            title='SHAP value',
+            tickfont=dict(size=9),
+            gridcolor='#f1f5f9',
+            zerolinecolor='#94a3b8',
+        ),
+        yaxis=dict(tickfont=dict(size=10)),
+        height=180,
+        margin=dict(l=10, r=60, t=36, b=30),
+        paper_bgcolor='white',
+        plot_bgcolor='white',
+    )
+    return fig
+
+# ============================================================
+# REPORT RENDERER
+# ============================================================
+ACTIONS = {
+    'Malaria'      : 'Confirm with RDT / blood smear',
+    'Dengue'       : 'Observe, check platelet count',
+    'Yellow Fever' : 'Isolate & notify health authority',
+    'Typhoid'      : 'Blood culture & empirical antibiotics',
+    'Others'       : 'Investigate further',
+}
+
+def render_report(pred, X_arr=None, show_shap=True,
+                  true_dx=None, patient_info=None):
+    mean_p   = pred['mean']
+    lo       = pred['lower']
+    hi       = pred['upper']
+    std      = pred['std']
+    source   = pred['source']
+    unc_flag = std > UNC_P75
+
+    # ── Patient summary card ──────────────────────────────
+    if patient_info:
+        cols = st.columns(4)
+        info_items = [
+            ("Patient", patient_info.get('id', '—')),
+            ("Age",     patient_info.get('age', '—')),
+            ("Gender",  patient_info.get('gender', '—')),
+            ("Facility",patient_info.get('faskes', '—')),
+        ]
+        for col, (label, value) in zip(cols, info_items):
+            with col:
+                st.markdown(
+                    f"<div class='metric-card'>"
+                    f"<div class='label'>{label}</div>"
+                    f"<div class='value'>{value}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True)
+        st.markdown("")
+
+    # ── Uncertainty banner ────────────────────────────────
+    if source == 'population_estimate':
+        st.info(
+            "ℹ️ CI shown is a population-level estimate "
+            "(±1.96 × population std). "
+            "Individual bootstrap CI available in Tab 3.")
+
+    if unc_flag:
+        st.markdown(
+            f"<div class='unc-high'>⚠️ <b>High uncertainty</b> "
+            f"(std={std:.4f} > P75={UNC_P75:.4f}) "
+            f"— second opinion recommended</div>",
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f"<div class='unc-ok'>✓ <b>Confidence within "
+            f"normal range</b> (std={std:.4f})</div>",
+            unsafe_allow_html=True)
+
+    # ── Radar chart ───────────────────────────────────────
+    st.markdown(
+        "<div class='section-header'>"
+        "Disease Probability Overview</div>",
+        unsafe_allow_html=True)
+
+    col_radar, col_detail = st.columns([1, 2])
+    with col_radar:
+        st.plotly_chart(
+            plot_radar(mean_p),
+            use_container_width=True,
+            config={'displayModeBar': False})
+
+    with col_detail:
+        sorted_idx = np.argsort(mean_p)[::-1]
+        for i in sorted_idx:
+            label  = LABELS[i]
+            prob   = float(mean_p[i])
+            above  = prob >= THRESHOLDS[i]
+            color  = COLORS_HEX[i]
+            action = ACTIONS[label] if above else "Monitor"
+            badge_cls = "action-treat" if above else "action-monitor"
+            marker    = "●" if above else "○"
+
+            st.markdown(
+                f"<div class='disease-card "
+                f"{'above' if above else ''}'>"
+                f"<div style='display:flex;justify-content:"
+                f"space-between;align-items:center'>"
+                f"<div>"
+                f"<span style='color:{color};font-size:16px'>"
+                f"{marker}</span> "
+                f"<span class='dis-name'>{label}</span>"
+                f"</div>"
+                f"<div style='text-align:right'>"
+                f"<span class='dis-prob' "
+                f"style='color:{color}'>{prob*100:.1f}%</span>"
+                f"</div>"
+                f"</div>"
+                f"<div style='margin-top:6px;display:flex;"
+                f"justify-content:space-between;"
+                f"align-items:center'>"
+                f"<span class='dis-ci'>"
+                f"95% CI: [{float(lo[i])*100:.1f}% – "
+                f"{float(hi[i])*100:.1f}%] "
+                f"| threshold={THRESHOLDS[i]:.2f}</span>"
+                f"<span class='action-badge {badge_cls}'>"
+                f"→ {action}</span>"
+                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True)
+
+    # ── Gauge charts ──────────────────────────────────────
+    st.markdown(
+        "<div class='section-header'>Probability Gauges</div>",
+        unsafe_allow_html=True)
+    gauge_cols = st.columns(5)
+    for i, col in enumerate(gauge_cols):
+        with col:
+            st.plotly_chart(
+                plot_gauge(
+                    float(mean_p[i]),
+                    float(THRESHOLDS[i]),
+                    LABELS[i],
+                    COLORS_HEX[i]),
+                use_container_width=True,
+                config={'displayModeBar': False})
+
+    # ── SHAP ──────────────────────────────────────────────
+    if show_shap and X_arr is not None:
+        above_labels = [i for i in range(5)
+                        if float(mean_p[i]) >= THRESHOLDS[i]]
+        if above_labels:
+            st.markdown(
+                "<div class='section-header'>"
+                "Key Contributing Factors (SHAP)</div>",
+                unsafe_allow_html=True)
+            shap_cols = st.columns(min(len(above_labels), 3))
+            for ci, i in enumerate(above_labels[:3]):
+                top3 = get_shap_top3(X_arr, i)
+                with shap_cols[ci]:
+                    st.plotly_chart(
+                        plot_shap_bar(top3, LABELS[i],
+                                      COLORS_HEX[i]),
+                        use_container_width=True,
+                        config={'displayModeBar': False})
+                    for feat, sv, fv in top3:
+                        direction = ("↑ increases"
+                                     if sv > 0 else
+                                     "↓ decreases")
+                        c = "#dc2626" if sv > 0 else "#2563eb"
+                        st.markdown(
+                            f"<div style='font-size:11px;"
+                            f"padding:2px 0;color:#475569'>"
+                            f"<code style='font-size:10px'>"
+                            f"{feat[:28]}</code> "
+                            f"val=<b>{fv:.2f}</b> "
+                            f"<span style='color:{c}'>"
+                            f"SHAP={sv:+.3f} {direction}"
+                            f"</span></div>",
+                            unsafe_allow_html=True)
+
+    # ── Clinical confirmation checklist ───────────────────
+    st.markdown(
+        "<div class='section-header'>"
+        "Clinical Confirmation Checklist</div>",
+        unsafe_allow_html=True)
+    st.caption(
+        "Check findings confirmed by clinical examination")
+
+    above_labels_check = [i for i in range(5)
+                          if float(mean_p[i]) >= THRESHOLDS[i]]
+    if above_labels_check:
+        check_items = {
+            'Malaria'      : ['RDT positive', 'Blood smear positive',
+                              'Fever pattern consistent'],
+            'Dengue'       : ['Platelet < 150k',
+                              'Positive tourniquet test',
+                              'NS1/IgM positive'],
+            'Yellow Fever' : ['Jaundice present',
+                              'Hemorrhagic signs',
+                              'Epidemiological exposure'],
+            'Typhoid'      : ['Blood culture sent',
+                              'Relative bradycardia',
+                              'Rose spots observed'],
+            'Others'       : ['Alternative diagnosis considered',
+                              'Specialist referral planned'],
+        }
+        check_cols = st.columns(min(len(above_labels_check), 3))
+        for ci, i in enumerate(above_labels_check[:3]):
+            label = LABELS[i]
+            with check_cols[ci]:
+                st.markdown(
+                    f"**{label}** "
+                    f"({float(mean_p[i])*100:.1f}%)")
+                for item in check_items.get(label, []):
+                    key = f"chk_{label}_{item}_{id(pred)}"
+                    st.checkbox(item, key=key)
+    else:
+        st.caption(
+            "No labels above threshold — "
+            "all diseases below action threshold.")
+
+    # ── Ground truth ──────────────────────────────────────
+    if true_dx is not None:
+        st.markdown("---")
+        st.caption(
+            f"[Evaluation only] True diagnosis: "
+            f"{', '.join(true_dx) if true_dx else 'None'}")
+
+    # ── Disclaimer ────────────────────────────────────────
+    st.markdown(
+        "<div class='disclaimer'>⚕️ <b>DISCLAIMER:</b> "
+        "This output is for clinical decision support only. "
+        "It does not constitute medical advice or diagnosis. "
+        "All clinical decisions must be confirmed by a "
+        "licensed medical professional based on full clinical "
+        "assessment and laboratory findings.</div>",
+        unsafe_allow_html=True)
+
+# ============================================================
+# AI CHAT
 # ============================================================
 def build_context_message(pred, shap_results, patient_info):
     mean_p = pred['mean']
@@ -315,7 +767,10 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
     if context_key not in st.session_state:
         st.session_state[context_key] = False
 
-    st.markdown("### 🤖 AI Clinical Assistant")
+    st.markdown(
+        "<div class='section-header'>"
+        "🤖 AI Clinical Assistant</div>",
+        unsafe_allow_html=True)
     st.caption(
         "Ask follow-up questions about this assessment · "
         "For decision support only")
@@ -351,10 +806,9 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 with st.spinner(
                         "Generating initial interpretation..."):
                     try:
-                        # PERUBAHAN: Menggunakan llama-3.1-8b-instant
                         response = \
                             client.chat.completions.create(
-                                model="llama-3.1-8b-instant", 
+                                model="llama-3.1-8b-instant",
                                 messages=[
                                     {"role"   : "system",
                                      "content": SYSTEM_PROMPT},
@@ -383,8 +837,11 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 st.rerun()
 
     if st.session_state[context_key]:
-        display_history = st.session_state[hist_key][1:]
+        st.markdown(
+            "<div class='chat-container'>",
+            unsafe_allow_html=True)
 
+        display_history = st.session_state[hist_key][1:]
         for msg in display_history:
             if msg["role"] == "assistant":
                 with st.chat_message("assistant",
@@ -395,8 +852,11 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                                      avatar="👤"):
                     st.markdown(msg["content"])
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
         user_input = st.chat_input(
-            "Ask a follow-up question...",
+            "Ask a follow-up question about this "
+            "assessment...",
             key=f"chat_input_{chat_key}")
 
         if user_input:
@@ -404,12 +864,10 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                 "role"   : "user",
                 "content": user_input,
             })
-
             with st.chat_message("assistant", avatar="⚕️"):
                 response_placeholder = st.empty()
                 full_response        = ""
                 try:
-                    # PERUBAHAN: Menggunakan llama-3.1-8b-instant
                     stream = client.chat.completions.create(
                         model="llama-3.1-8b-instant",
                         messages=[
@@ -421,12 +879,14 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                         stream=True,
                     )
                     for chunk in stream:
-                        delta = chunk.choices[0].delta.content
+                        delta = \
+                            chunk.choices[0].delta.content
                         if delta:
                             full_response += delta
                             response_placeholder.markdown(
                                 full_response + "▌")
-                    response_placeholder.markdown(full_response)
+                    response_placeholder.markdown(
+                        full_response)
                     st.session_state[hist_key].append({
                         "role"   : "assistant",
                         "content": full_response,
@@ -435,171 +895,79 @@ def render_ai_chat(pred, X_arr, patient_info, chat_key):
                     st.error(f"API error: {e}")
 
         st.caption(
-            "⚕️ AI responses are for clinical decision support "
-            "only. Not medical advice. Confirm all decisions "
-            "with a licensed medical professional.")
-
-# ============================================================
-# REPORT RENDERER
-# ============================================================
-COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981', '#8b5cf6']
-ACTIONS = {
-    'Malaria'      : 'Confirm with RDT / blood smear',
-    'Dengue'       : 'Observe, check platelet count',
-    'Yellow Fever' : 'Isolate & notify health authority',
-    'Typhoid'      : 'Blood culture & empirical antibiotics',
-    'Others'       : 'Investigate further',
-}
-
-def render_report(pred, X_arr=None, show_shap=True,
-                  true_dx=None):
-    mean_p   = pred['mean']
-    lo       = pred['lower']
-    hi       = pred['upper']
-    std      = pred['std']
-    source   = pred['source']
-    unc_flag = std > UNC_P75
-
-    if source == 'population_estimate':
-        st.info(
-            "ℹ️ CI shown is a population-level estimate "
-            "(±1.96 × population std from training bootstrap). "
-            "Individual bootstrap CI available in Tab 3.")
-
-    if unc_flag:
-        st.warning(
-            f"⚠️ High uncertainty "
-            f"(std={std:.4f} > P75={UNC_P75:.4f}) "
-            f"— second opinion recommended")
-    else:
-        st.success(
-            f"✓ Confidence within normal range "
-            f"(std={std:.4f})")
-
-    st.markdown("**Disease probability assessment** "
-                "| Threshold: median 5-fold CV")
-
-    for i in np.argsort(mean_p)[::-1]:
-        label  = LABELS[i]
-        prob   = float(mean_p[i])
-        above  = prob >= THRESHOLDS[i]
-        marker = "●" if above else "○"
-        color  = COLORS[i]
-        action = ACTIONS[label] if above else "Monitor"
-
-        c1, c2, c3 = st.columns([2, 3, 3])
-        with c1:
-            st.markdown(
-                f"<span style='color:{color};"
-                f"font-weight:600'>{marker} {label}</span>",
-                unsafe_allow_html=True)
-        with c2:
-            st.progress(prob)
-            st.caption(
-                f"{prob*100:.1f}% "
-                f"[{float(lo[i])*100:.1f}–"
-                f"{float(hi[i])*100:.1f}%]")
-        with c3:
-            if above:
-                st.error(f"→ {action}")
-            else:
-                st.info("→ Monitor")
-
-    st.caption(
-        "● above threshold → action | ○ below → monitor | "
-        + " | ".join([f"{l[:3]}={t:.2f}"
-                      for l, t in zip(LABELS, THRESHOLDS)]))
-
-    if show_shap and X_arr is not None:
-        above_labels = [i for i in range(5)
-                        if float(mean_p[i]) >= THRESHOLDS[i]]
-        if above_labels:
-            st.markdown("---")
-            st.markdown("**Top contributing factors (SHAP)**")
-            for i in above_labels[:3]:
-                with st.expander(
-                        f"{LABELS[i]} — "
-                        f"{float(mean_p[i])*100:.1f}%",
-                        expanded=True):
-                    top3 = get_shap_top3(X_arr, i)
-                    for feat, sv, fv in top3:
-                        direction = ("↑ increases" if sv > 0
-                                     else "↓ decreases")
-                        color_sv  = ("red" if sv > 0
-                                     else "blue")
-                        st.markdown(
-                            f"`{feat}` &nbsp; "
-                            f"val=**{fv:.2f}** &nbsp; "
-                            f"<span style='color:{color_sv}'>"
-                            f"SHAP={sv:+.4f} "
-                            f"{direction}</span>",
-                            unsafe_allow_html=True)
-
-    if true_dx is not None:
-        st.markdown("---")
-        st.caption(
-            "[Evaluation only] True diagnosis: "
-            f"{', '.join(true_dx) if true_dx else 'None'}")
-
-    st.markdown("---")
-    st.caption(
-        "⚕️ For clinical decision support only. "
-        "Final diagnosis must be confirmed by a licensed "
-        "medical professional.")
+            "⚕️ AI responses are for clinical decision "
+            "support only. Not medical advice.")
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.title("⚕️ VBD CDSS")
-    st.caption(
-        "Vector-Borne Disease\n"
-        "Clinical Decision Support System")
+    st.markdown(
+        "<div style='text-align:center;padding:8px 0'>"
+        "<span style='font-size:32px'>⚕️</span>"
+        "<div style='font-size:16px;font-weight:700;"
+        "color:#1e293b;margin-top:4px'>VBD CDSS</div>"
+        "<div style='font-size:11px;color:#64748b'>"
+        "Clinical Decision Support</div>"
+        "</div>",
+        unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown("**Model**")
-    st.caption("Random Forest (Binary Relevance)")
-    st.caption("CV F1 Macro: 0.6272 ± 0.0376")
-    st.caption("N=300 patients, Burkina Faso")
-    st.caption("Seed: 456")
+
+    st.markdown("**🧠 Model**")
+    st.caption("Binary Relevance Random Forest")
+    st.caption("CV F1 Macro: **0.6272 ± 0.0376**")
+    st.caption("N=300 · Burkina Faso · Seed=456")
     st.markdown("---")
-    st.markdown("**Thresholds (median 5-fold CV)**")
-    for l, t in zip(LABELS, THRESHOLDS):
-        st.caption(f"{l}: {t:.2f}")
+
+    st.markdown("**📊 Thresholds** (median 5-fold CV)")
+    for l, t, c in zip(LABELS, THRESHOLDS, COLORS_HEX):
+        st.markdown(
+            f"<div style='display:flex;justify-content:"
+            f"space-between;font-size:12px;padding:2px 0'>"
+            f"<span style='color:{c};font-weight:500'>"
+            f"{l}</span>"
+            f"<span style='color:#64748b'>{t:.2f}</span>"
+            f"</div>",
+            unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown("**Uncertainty**")
+
+    st.markdown("**📉 Uncertainty**")
     st.caption(f"P75 threshold : {UNC_P75:.4f}")
     st.caption(f"Pop mean std  : {POP_MEAN_STD:.4f}")
     st.markdown("---")
-    st.markdown("**Per-label pop std**")
-    for l, s in zip(LABELS, POP_STD_LABEL):
-        st.caption(f"{l}: {s:.4f}")
-    st.markdown("---")
-    st.markdown("**AI Assistant**")
-    grok_ok = st.secrets.get("GROQ_API_KEY", None) is not None
+
+    st.markdown("**🤖 AI Assistant**")
+    grok_ok = st.secrets.get(
+        "GROQ_API_KEY", None) is not None
     if grok_ok:
-        st.success("Groq AI: connected") 
+        st.success("Groq AI: connected")
     else:
         st.warning("Groq AI: not configured")
 
 # ============================================================
-# MAIN
+# HEADER
 # ============================================================
-st.title("Vector-Borne Disease")
-st.subheader("Clinical Decision Support System")
-st.caption(
-    "Multi-label prediction · "
-    "Malaria · Dengue · Yellow Fever · Typhoid · Others")
-st.markdown("---")
+st.markdown(
+    "<div class='main-header'>"
+    "<h1>⚕️ Vector-Borne Disease CDSS</h1>"
+    "<p>Multi-label Clinical Decision Support · "
+    "Malaria · Dengue · Yellow Fever · Typhoid · Others · "
+    "Burkina Faso, West Africa</p>"
+    "</div>",
+    unsafe_allow_html=True)
 
 tab1, tab2, tab3 = st.tabs([
-    "📋 Manual input",
+    "📋 Manual Input",
     "📁 Upload CSV",
-    "🔍 Dataset patient lookup",
+    "🔍 Dataset Lookup",
 ])
 
 # ── TAB 1: MANUAL INPUT ───────────────────────────────────
 with tab1:
-    st.markdown("### Patient information")
+    st.markdown(
+        "<div class='section-header'>"
+        "Patient Information</div>",
+        unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -615,40 +983,33 @@ with tab1:
             "Facility",
             ["CMA de DO", "CMA de DAFRA"], index=0)
 
-    st.markdown("### Clinical symptoms")
-    st.caption("Check all symptoms present")
+    st.markdown(
+        "<div class='section-header'>"
+        "Clinical Symptoms</div>",
+        unsafe_allow_html=True)
+    st.caption("Check all symptoms present in this patient")
 
     symptoms = {
         'Fièvre depuis 48 heures(Fever 48 hrs)':
-            'Fever >= 48h',
+            'Fever ≥ 48h',
         'Fièvre au cours des 7 derniers jours (Fever in the last 7 days)':
             'Fever last 7 days',
         'Haute température.(temperature, Hyperpyrexia)':
             'High temperature / hyperpyrexia',
-        'Toux (Cough)':
-            'Cough',
-        'Douleur musculaire ( Muscle pain)':
-            'Muscle pain',
-        'Douleur articulaire (Joint pain)':
-            'Joint pain',
-        'Vomissement (Vomiting)':
-            'Vomiting',
-        'Diarrhée  (Diarrhea)':
-            'Diarrhea',
-        'Douleur abdominale (stomac pain)':
-            'Abdominal pain',
-        'Nausée (Nausea)':
-            'Nausea',
+        'Toux (Cough)': 'Cough',
+        'Douleur musculaire ( Muscle pain)': 'Muscle pain',
+        'Douleur articulaire (Joint pain)': 'Joint pain',
+        'Vomissement (Vomiting)': 'Vomiting',
+        'Diarrhée  (Diarrhea)': 'Diarrhea',
+        'Douleur abdominale (stomac pain)': 'Abdominal pain',
+        'Nausée (Nausea)': 'Nausea',
         'Convulsions généralisées ou focales (Generalised or focal convulsion)':
             'Convulsions',
-        'Prostration':
-            'Prostration',
-        'Ictère (Icterus)':
-            'Jaundice (Icterus)',
+        'Prostration': 'Prostration',
+        'Ictère (Icterus)': 'Jaundice (Icterus)',
         'Saignement/ Manifestations hémorragiques (Bleeding)':
             'Bleeding / hemorrhagic signs',
-        'Vertige (Dizzy)':
-            'Dizziness',
+        'Vertige (Dizzy)': 'Dizziness',
         'Détresse respiratoire (Respiratory distress)':
             'Respiratory distress',
         'Pâleur cutanéo muqueuse ou Anémie (Mucosal skin pallor or Anemia)':
@@ -665,27 +1026,29 @@ with tab1:
         with col:
             for orig, label in sym_list[ci*n_per:(ci+1)*n_per]:
                 sym_vals[orig] = st.checkbox(
-                    label,
-                    key=f"sym_{ci}_{hash(orig)}")
+                    label, key=f"sym_{ci}_{hash(orig)}")
 
-    st.markdown("### Lab values (optional)")
+    st.markdown(
+        "<div class='section-header'>"
+        "Lab Values (optional)</div>",
+        unsafe_allow_html=True)
     lc1, lc2, lc3 = st.columns(3)
     with lc1:
         platelet = st.number_input(
-            "Platelet count (x10^3/uL)",
+            "Platelet (×10³/µL)",
             min_value=0, max_value=1000,
             value=150, step=1)
         wbc = st.number_input(
-            "WBC count (cells/uL)",
+            "WBC (cells/µL)",
             min_value=0, max_value=50000,
             value=7000, step=100)
     with lc2:
         temp_val = st.number_input(
-            "Axillary temperature (C)",
+            "Temperature (°C)",
             min_value=35.0, max_value=42.0,
             value=37.5, step=0.1)
         pulse = st.number_input(
-            "Pulse rate (bpm)",
+            "Pulse (bpm)",
             min_value=40, max_value=200,
             value=80, step=1)
     with lc3:
@@ -694,10 +1057,11 @@ with tab1:
             min_value=1, max_value=150,
             value=60, step=1)
 
-    if st.button("Generate assessment",
-                 type="primary",
-                 use_container_width=True,
-                 key="btn_manual"):
+    if st.button(
+            "⚡ Generate Assessment",
+            type="primary",
+            use_container_width=True,
+            key="btn_manual"):
 
         row = {col: 0.0 for col in FEATURE_NAMES}
 
@@ -711,10 +1075,10 @@ with tab1:
             'Nombre_de_globules_blancs_cellulesML_Whi' : float(wbc),
             'Température_axillaire_médiane_IQR_C_Axil' : float(temp_val),
             'Fréquence_du_pouls_battementsm_in_SD_Pul' : float(pulse),
-            'Poids_Weight'                             : float(weight),
-            'Âge_Age'                                  : float(age),
-            'Genre_Gender'      : 1.0 if gender == 'Male' else 0.0,
-            'Centre_de_santé'   : 0.0 if faskes == 'CMA de DO' else 1.0,
+            'Poids_Weight'                              : float(weight),
+            'Âge_Age'                                   : float(age),
+            'Genre_Gender'    : 1.0 if gender == 'Male' else 0.0,
+            'Centre_de_santé' : 0.0 if faskes == 'CMA de DO' else 1.0,
         }
         for k, v in lab_map.items():
             if k in row:
@@ -767,8 +1131,8 @@ with tab1:
         row['FE_resp_score']       = resp_score
         row['FE_neuro_score']      = neuro_score
         row['FE_fever_score']      = fever_score
-        row['FE_has_msk']          = float(msk_score    >= 2)
-        row['FE_has_gi']           = float(gi_score     >= 2)
+        row['FE_has_msk']          = float(msk_score   >= 2)
+        row['FE_has_gi']           = float(gi_score    >= 2)
         row['FE_has_resp']         = float(resp_score  >= 2)
         row['FE_has_neuro']        = float(neuro_score >= 2)
         row['FE_dengue_pattern']   = msk_score * gi_score
@@ -790,25 +1154,24 @@ with tab1:
             dtype=np.float32)
 
         st.session_state['X_manual_tab1'] = X_manual
-        st.session_state['pred_tab1']     = predict_new_patient(
-            X_manual)
+        st.session_state['pred_tab1']     = \
+            predict_new_patient(X_manual)
         st.session_state['pinfo_tab1']    = {
+            'id'    : 'Manual Input',
             'age'   : f"{age} years",
             'gender': gender,
             'faskes': faskes,
         }
-        # Reset chat saat generate baru
-        st.session_state['chat_history_tab1']    = []
+        st.session_state['chat_history_tab1']     = []
         st.session_state['chat_context_set_tab1'] = False
 
-    # Tampilkan hasil jika sudah ada
     if 'pred_tab1' in st.session_state:
         st.markdown("---")
-        st.markdown("### Assessment result")
         render_report(
             st.session_state['pred_tab1'],
             X_arr=st.session_state['X_manual_tab1'],
-            show_shap=True)
+            show_shap=True,
+            patient_info=st.session_state['pinfo_tab1'])
         st.markdown("---")
         render_ai_chat(
             st.session_state['pred_tab1'],
@@ -818,7 +1181,10 @@ with tab1:
 
 # ── TAB 2: UPLOAD CSV ─────────────────────────────────────
 with tab2:
-    st.markdown("### Upload patient CSV")
+    st.markdown(
+        "<div class='section-header'>"
+        "Upload Patient CSV</div>",
+        unsafe_allow_html=True)
     st.caption(
         "Upload a CSV file with French column names matching "
         "the original dataset format. "
@@ -831,16 +1197,18 @@ with tab2:
         try:
             df_up = pd.read_csv(uploaded)
             st.success(
-                f"Loaded {len(df_up)} patients, "
+                f"✓ Loaded **{len(df_up)} patients**, "
                 f"{len(df_up.columns)} columns")
 
             with st.expander("Preview data", expanded=False):
-                st.dataframe(df_up.head(5))
+                st.dataframe(df_up.head(5),
+                             use_container_width=True)
 
-            if st.button("Run batch assessment",
-                         type="primary",
-                         use_container_width=True,
-                         key="btn_csv"):
+            if st.button(
+                    "⚡ Run Batch Assessment",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_csv"):
 
                 with st.spinner(
                         "Preprocessing & predicting..."):
@@ -852,16 +1220,20 @@ with tab2:
                     probas_b = apply_yf_rules(
                         X_batch, probas_b, FEATURE_NAMES)
 
-                st.session_state['X_batch_tab2']   = X_batch
-                st.session_state['probas_b_tab2']  = probas_b
+                st.session_state['X_batch_tab2']  = X_batch
+                st.session_state['probas_b_tab2'] = probas_b
+                st.session_state['df_up_tab2']    = df_up
 
-            if ('X_batch_tab2' in st.session_state and
-                    'probas_b_tab2' in st.session_state):
-
+            if 'X_batch_tab2' in st.session_state:
                 X_batch  = st.session_state['X_batch_tab2']
                 probas_b = st.session_state['probas_b_tab2']
+                df_up    = st.session_state['df_up_tab2']
 
-                st.markdown("### Batch results summary")
+                st.markdown(
+                    "<div class='section-header'>"
+                    "Batch Results Summary</div>",
+                    unsafe_allow_html=True)
+
                 results = pd.DataFrame(
                     (probas_b >= THRESHOLDS).astype(int),
                     columns=LABELS)
@@ -875,24 +1247,48 @@ with tab2:
                 results['top_prob'] = \
                     probas_b.max(axis=1).round(3)
 
-                st.dataframe(results,
-                             use_container_width=True)
+                # Summary metrics
+                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                metrics = [
+                    ("Total", len(df_up), ""),
+                    ("Co-infections",
+                     (results['n_diseases'] >= 2).sum(),
+                     f"{(results['n_diseases']>=2).mean()*100:.1f}%"),
+                    ("Malaria",
+                     results['Malaria'].sum(), ""),
+                    ("Dengue",
+                     results['Dengue'].sum(), ""),
+                    ("Yellow Fever",
+                     results['Yellow Fever'].sum(), ""),
+                ]
+                for col, (lbl, val, delta) in zip(
+                        [mc1,mc2,mc3,mc4,mc5], metrics):
+                    with col:
+                        st.metric(lbl, val,
+                                  delta if delta else None)
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("Total patients", len(df_up))
-                with c2:
-                    n_co = (results['n_diseases'] >= 2).sum()
-                    st.metric("Co-infections", n_co,
-                              f"{n_co/len(df_up)*100:.1f}%")
-                with c3:
-                    st.metric("Malaria predicted",
-                              results['Malaria'].sum())
-                with c4:
-                    st.metric("Yellow Fever predicted",
-                              results['Yellow Fever'].sum())
+                # Population radar
+                pop_mean = probas_b.mean(axis=0)
+                st.plotly_chart(
+                    plot_radar(pop_mean),
+                    use_container_width=True,
+                    config={'displayModeBar': False})
+                st.caption(
+                    "Population average probability "
+                    "across all uploaded patients")
 
-                st.markdown("### Per-patient detail")
+                # Results table
+                st.dataframe(
+                    results.style.background_gradient(
+                        subset=LABELS, cmap='RdYlGn',
+                        vmin=0, vmax=1),
+                    use_container_width=True)
+
+                # Per-patient detail
+                st.markdown(
+                    "<div class='section-header'>"
+                    "Per-Patient Detail</div>",
+                    unsafe_allow_html=True)
                 pat_sel = st.selectbox(
                     "Select patient for detailed report",
                     range(len(df_up)),
@@ -905,7 +1301,13 @@ with tab2:
                 render_report(
                     pred_sel,
                     X_arr=X_batch[pat_sel:pat_sel+1],
-                    show_shap=True)
+                    show_shap=True,
+                    patient_info={
+                        'id'    : f'#{pat_sel}',
+                        'age'   : 'From CSV',
+                        'gender': 'From CSV',
+                        'faskes': 'From CSV',
+                    })
 
                 st.markdown("---")
                 render_ai_chat(
@@ -917,53 +1319,61 @@ with tab2:
                     chat_key=f"tab2_{pat_sel}")
 
                 st.download_button(
-                    "Download results CSV",
+                    "⬇️ Download Results CSV",
                     data=results.to_csv(index=False),
                     file_name="vbd_cdss_results.csv",
                     mime="text/csv",
                     use_container_width=True)
 
         except Exception as e:
-            st.error(f"Error processing file: {e}")
+            st.error(f"Error: {e}")
             st.caption(
                 "Ensure CSV format matches the original "
                 "dataset (French column names).")
 
-# ── TAB 3: DATASET PATIENT LOOKUP ─────────────────────────
+# ── TAB 3: DATASET LOOKUP ─────────────────────────────────
 with tab3:
-    st.markdown("### Dataset patient lookup")
+    st.markdown(
+        "<div class='section-header'>"
+        "Dataset Patient Lookup</div>",
+        unsafe_allow_html=True)
     st.caption(
         "Look up a patient from the original 300-patient "
         "dataset. Uses exact bootstrap CI from notebook "
-        "(N=50 iterations).")
+        "(N=50 iterations) — identical to notebook output.")
 
     pat_idx = st.number_input(
-        "Patient index (0-299)",
+        "Patient index (0–299)",
         min_value=0, max_value=299,
         value=16, step=1)
 
-    if st.button("Lookup patient",
-                 type="primary",
-                 use_container_width=True,
-                 key="btn_lookup"):
+    if st.button(
+            "🔍 Lookup Patient",
+            type="primary",
+            use_container_width=True,
+            key="btn_lookup"):
 
         pred = predict_dataset_patient(int(pat_idx))
-        st.session_state['pred_tab3']    = pred
-        st.session_state['patidx_tab3']  = int(pat_idx)
-        # Reset chat saat lookup baru
+        st.session_state['pred_tab3']   = pred
+        st.session_state['patidx_tab3'] = int(pat_idx)
         st.session_state['chat_history_tab3']     = []
         st.session_state['chat_context_set_tab3'] = False
 
     if 'pred_tab3' in st.session_state:
         idx_shown = st.session_state['patidx_tab3']
-        st.markdown(f"### Report — Patient #{idx_shown}")
-        st.caption("Bootstrap CI: exact from notebook (N=50).")
+        st.caption(
+            f"Bootstrap CI: exact from notebook (N=50).")
 
         render_report(
             st.session_state['pred_tab3'],
             X_arr=None,
             show_shap=False,
-            true_dx=None)
+            patient_info={
+                'id'    : f'#{idx_shown}',
+                'age'   : 'From dataset',
+                'gender': 'From dataset',
+                'faskes': 'From dataset',
+            })
 
         st.markdown("---")
         render_ai_chat(
